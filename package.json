@@ -1,0 +1,26 @@
+{
+  "name": "micro-fetch",
+  "version": "0.1.0",
+  "description": "Wraps nodejs built-in modules and browser fetch into one function.",
+  "main": "index.js",
+  "files": ["index.js", "index.d.ts"],
+  "scripts": {
+    "build": "tsc -d",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "fetch",
+    "http",
+    "https",
+    "node",
+    "browser",
+    "ajax",
+    "request"
+  ],
+  "author": "Paul Miller (https://paulmillr.com)",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^14.0.14",
+    "typescript": "^3.9.5"
+  }
+}
