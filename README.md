@@ -2,6 +2,8 @@
 
 Tiny optimized `fetch()`-like node.js and browser method with binary/JSON, CORS, redirects & SSL pinning.
 
+Also, take a look at [fetch-streaming](https://github.com/paulmillr/fetch-streaming).
+
 ## Usage
 
 Can be used in browser and in node.js.
