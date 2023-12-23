@@ -119,7 +119,7 @@ function fetchNode(url, _options) {
                     await fetchNode(url, { ...options, sslAllowSelfSigned: true, sslPinnedCertificates: [] });
                 }
                 catch (e) {
-                    if (e && e.fingerprint256) {
+                    if (e && typeof e === 'object' && 'fingerprint256' in e) {
                         err = new InvalidCertError(`Self-signed SSL certificate: ${e.fingerprint256}`, e.fingerprint256);
                     }
                 }

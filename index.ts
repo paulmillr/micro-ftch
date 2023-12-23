@@ -1,5 +1,11 @@
+// @ts-ignore
 import { Agent } from 'http';
+// @ts-ignore
 import { TLSSocket } from 'tls';
+
+declare const process: any;
+declare const require: any;
+declare const Buffer: any;
 
 export type FETCH_OPT = {
   method?: string;
@@ -30,7 +36,7 @@ const DEFAULT_OPT: FETCH_OPT = Object.freeze({
 });
 
 export class InvalidCertError extends Error {
-  constructor(msg: string, public readonly fingerprint256: string) {
+  constructor(msg: string, readonly fingerprint256: string) {
     super(msg);
   }
 }
@@ -122,10 +128,10 @@ function fetchNode(url: string, _options?: Partial<FETCH_OPT>): Promise<any> {
         try {
           await fetchNode(url, { ...options, sslAllowSelfSigned: true, sslPinnedCertificates: [] });
         } catch (e) {
-          if (e && e.fingerprint256) {
+          if (e && typeof e === 'object' && 'fingerprint256' in e) {
             err = new InvalidCertError(
               `Self-signed SSL certificate: ${e.fingerprint256}`,
-              e.fingerprint256
+              (e as InvalidCertError).fingerprint256
             );
           }
         }
@@ -162,7 +168,7 @@ function fetchNode(url: string, _options?: Partial<FETCH_OPT>): Promise<any> {
         // Avoid memory leak if socket is reused and already has listener
         const hasListeners = socket
           .listeners('secureConnect')
-          .map((i) => (i.name || '').replace('bound ', ''))
+          .map((i: any) => (i.name || '').replace('bound ', ''))
           .includes('mfetchSecureConnect');
         if (hasListeners) return;
         socket.on('secureConnect', mfetchSecureConnect.bind(null, socket));

@@ -1,4 +1,4 @@
-export declare type FETCH_OPT = {
+export type FETCH_OPT = {
     method?: string;
     type?: 'text' | 'json' | 'bytes';
     redirect: boolean;
