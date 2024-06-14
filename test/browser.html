@@ -1,0 +1,19 @@
+<html><head><title>Test</title></head><body><h1>TEST</h1>
+<script>window.exports = {}</script>
+<script src="../index.js"></script>
+<script src="./common.js"></script>
+<script>
+const log = (...txt) => { document.body.innerHTML += `${txt.join(' ').replace('\n', '<br>')}<hr>`; };
+const error = (...txt) => log('[<span style="color:red">ERROR</span>]',...txt);
+const ok = (...txt) => log('[<span style="color:green">OK</span>]', ...txt);
+const run = async (txt, fn) => {
+    const ts = Date.now();
+    try { await fn(); ok(`${txt} done in ${Date.now()-ts} ms.`); }
+    catch(e){ error(txt, e); }
+}
+run('All', async()=>{
+    const fetch = window.exports.default;
+    const tests = {...window.exports.tests, ...window.exports.browser};
+    for (let k in tests) await run(k, tests[k].bind(null, fetch));
+});
+</script></body></html>
