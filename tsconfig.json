@@ -1,13 +1,9 @@
 {
+  "extends": "@paulmillr/jsbt/tsconfigs/cjs.json",
   "compilerOptions": {
-    "strict": true,
-    "target": "es2020",
-    "module": "commonjs",
-    "noImplicitAny": true,
-    "removeComments": true,
-    "preserveConstEnums": true,
-    "resolveJsonModule": true
+    "lib": ["es2019", "dom"],
+    "outDir": "lib"
   },
   "include": ["index.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "lib"]
 }
