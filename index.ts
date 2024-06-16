@@ -99,8 +99,11 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  * f('http://url/'); // will print request information
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
+  if ('killswitch' in opts && typeof opts.killswitch !== 'function')
+    throw new Error('opts.killswitch must be a function');
+  const noNetwork = () => opts.killswitch && !opts.killswitch();
   const wrappedFetch: FetchFn = async (url, reqOpts = {}) => {
-    if (opts.killswitch && !opts.killswitch()) throw new Error('Network disabled');
+    if (noNetwork()) throw new Error('killswitch: network disabled');
     if (opts.log) opts.log(url, reqOpts);
     const abort = new AbortController();
     let timeout = undefined;
@@ -127,9 +130,9 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       headers,
       signal: abort.signal,
     });
-    if (opts.killswitch && !opts.killswitch()) {
-      abort.abort('killswitch is true: network disabled');
-      throw new Error('killswitch is true: network disabled');
+    if (noNetwork()) {
+      abort.abort('killswitch: network disabled');
+      throw new Error('killswitch: network disabled');
     }
     const body = new Uint8Array(await res.arrayBuffer());
     if (timeout !== undefined) clearTimeout(timeout);

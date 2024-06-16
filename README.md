@@ -2,6 +2,8 @@
 
 Wrappers for [built-in fetch()](https://developer.mozilla.org/en-US/docs/Web/API/fetch) enabling killswitch, logging, concurrency limit and other features.
 
+fetch is great, however, its usage in secure environments is complicated. The library makes it simple.
+
 ## Usage
 
 > npm install micro-ftch
