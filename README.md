@@ -6,6 +6,9 @@ fetch is great, however, its usage in secure environments is complicated. The li
 
 ## Usage
 
+A standalone file
+[micro-ftch.js](https://github.com/paulmillr/micro-ftch/releases) is also available.
+
 > npm install micro-ftch
 
 There are three wrappers over `fetch()`:
