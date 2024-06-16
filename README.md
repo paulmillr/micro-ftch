@@ -16,6 +16,16 @@ There are three wrappers over `fetch()`:
 import { ftch, jsonrpc, replayable } from 'micro-ftch';
 ```
 
+- [Killswitch: instantly enable and disable network](#killswitch-instantly-enable-and-disable-network)
+- [Logging](#logging)
+- [Timeouts](#timeouts)
+- [Concurrency limit](#concurrency-limit)
+- [Basic auth](#basic-auth)
+- [jsonrpc](#jsonrpc)
+- [replayable](#replayable)
+- [Privacy](#privacy)
+- [License](#license)
+
 ### Killswitch: instantly enable and disable network
 
 When kill-switch is enabled, all requests will throw an error.
