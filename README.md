@@ -21,9 +21,7 @@ const net = ftch(fetch, {
   timeout: 5000,
   concurrencyLimit: 10,
 });
-const result = await net('https://example.com');
-
-net('https://user:pwd@httpbin.org/basic-auth/user/pwd'); // Basic auth
+const res = await net('https://example.com');
 
 // Composable
 const rpc = jsonrpc(net, 'http://rpc_node/', {
@@ -32,8 +30,9 @@ const rpc = jsonrpc(net, 'http://rpc_node/', {
 });
 const res1 = await rpc.call('method', 'arg0', 'arg1');
 const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named arguments
-
 const testRpc = replayable(rpc);
+// Basic auth auto-parsing
+await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
 ```
 
 - [ftch](#ftch)
