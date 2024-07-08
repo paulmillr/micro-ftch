@@ -2,7 +2,10 @@
   "name": "micro-ftch",
   "version": "0.4.0",
   "description": "Wrappers for built-in fetch() enabling killswitch, logging, concurrency limit and other features",
-  "files": ["lib", "index.ts"],
+  "files": [
+    "lib",
+    "index.ts"
+  ],
   "main": "lib/index.js",
   "module": "lib/esm/index.js",
   "types": "lib/index.d.ts",
@@ -16,9 +19,10 @@
   "devDependencies": {
     "@paulmillr/jsbt": "0.1.0",
     "micro-should": "0.4.0",
-    "prettier": "3.1.1",
-    "typescript": "5.3.2"
+    "prettier": "3.3.2",
+    "typescript": "5.5.2"
   },
+  "sideEffects": false,
   "author": "Paul Miller (https://paulmillr.com)",
   "license": "MIT",
   "homepage": "https://github.com/paulmillr/micro-ftch",
