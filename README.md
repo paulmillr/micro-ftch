@@ -11,32 +11,54 @@ A standalone file
 
 > npm install micro-ftch
 
-There are three wrappers over `fetch()`:
-
-1. `ftch(fetch)` - killswitch, logging, timeouts, concurrency limits, basic auth
-2. `jsonrpc(fetch)` - batched JSON-RPC functionality
-3. `replayable(fetch)` - log & replay network requests without actually calling network code.
-
 ```ts
 import { ftch, jsonrpc, replayable } from 'micro-ftch';
+
+let enabled = false;
+const net = ftch(fetch, {
+  killswitch: () => enabled,
+  log: (url, options) => console.log(url, options),
+  timeout: 5000,
+  concurrencyLimit: 10,
+});
+const result = await net('https://example.com');
+
+net('https://user:pwd@httpbin.org/basic-auth/user/pwd'); // Basic auth
+
+// Composable
+const rpc = jsonrpc(net, 'http://rpc_node/', {
+  headers: {},
+  batchSize: 20,
+});
+const res1 = await rpc.call('method', 'arg0', 'arg1');
+const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named arguments
+
+const testRpc = replayable(rpc);
 ```
 
 - [ftch](#ftch)
-  - [Killswitch: instantly enable and disable network](#killswitch-instantly-enable-and-disable-network)
-  - [Logging](#logging)
-  - [Timeouts](#timeouts)
-  - [Concurrency limit](#concurrency-limit)
+  - [killswitch](#killswitch)
+  - [log](#log)
+  - [timeout](#timeout)
+  - [concurrencyLimit](#concurrencyLimit)
   - [Basic auth](#basic-auth)
 - [jsonrpc](#jsonrpc)
 - [replayable](#replayable)
 - [Privacy](#privacy)
 - [License](#license)
 
+
+There are three wrappers over `fetch()`:
+
+1. `ftch(fetch)` - killswitch, logging, timeouts, concurrency limits, basic auth
+2. `jsonrpc(fetch)` - batched JSON-RPC functionality
+3. `replayable(fetch)` - log & replay network requests without actually calling network code.
+
 ## ftch
 
 Basic wrapper over `fetch()`.
 
-### Killswitch: instantly enable and disable network
+### killswitch
 
 When kill-switch is enabled, all requests will throw an error.
 You can dynamically enable and disable it any any time.
@@ -51,14 +73,14 @@ ENABLED = true;
 f('http://localhost'); // ok
 ```
 
-### Logging
+### log
 
 ```ts
 const f = ftch(fetch, { log: (url, opts) => console.log('fetching', url, opts) });
 f('http://url/'); // will print request information
 ```
 
-### Timeouts
+### timeout
 
 ```ts
 // browser and OS may have additional timeouts, we cannot override them
@@ -71,7 +93,7 @@ const f = ftch(fetch, { timeout: 1000 });
 const res = await f('http://url/'); // throws if request takes more than one second
 ```
 
-### Concurrency limit
+### concurrencyLimit
 
 Allows to not accidentally hit rate limits or do DoS.
 
