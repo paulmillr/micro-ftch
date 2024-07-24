@@ -48,7 +48,8 @@ export type FetchFn = (
 }>;
 
 export type FtchOpts = {
-  // TODO: killswitch => isValidRequest
+  // TODO: killswitch => isValidRequest or beforeEach
+  // maybe also pass options?
   killswitch?: (url?: string) => boolean;
   concurrencyLimit?: number;
   timeout?: number;
