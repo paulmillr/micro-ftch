@@ -48,7 +48,8 @@ export type FetchFn = (
 }>;
 
 export type FtchOpts = {
-  killswitch?: () => boolean;
+  // TODO: killswitch => isValidRequest
+  killswitch?: (url?: string) => boolean;
   concurrencyLimit?: number;
   timeout?: number;
   log?: (url: string, opts: FetchOpts) => void;
@@ -99,11 +100,10 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  * f('http://url/'); // will print request information
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
-  if ('killswitch' in opts && typeof opts.killswitch !== 'function')
+  if (opts.killswitch && typeof opts.killswitch !== 'function')
     throw new Error('opts.killswitch must be a function');
-  const noNetwork = () => opts.killswitch && !opts.killswitch();
+  const noNetwork = (url: string) => opts.killswitch && !opts.killswitch(url);
   const wrappedFetch: FetchFn = async (url, reqOpts = {}) => {
-    if (noNetwork()) throw new Error('killswitch: network disabled');
     if (opts.log) opts.log(url, reqOpts);
     const abort = new AbortController();
     let timeout = undefined;
@@ -124,15 +124,16 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       const h = reqOpts.headers instanceof Headers ? reqOpts.headers : new Headers(reqOpts.headers);
       h.forEach((v, k) => headers.set(k, v));
     }
+    if (noNetwork(url)) throw new Error('network disabled');
     const res = await fetchFunction(url, {
       referrerPolicy: 'no-referrer', // avoid sending referrer by default
       ...reqOpts,
       headers,
       signal: abort.signal,
     });
-    if (noNetwork()) {
-      abort.abort('killswitch: network disabled');
-      throw new Error('killswitch: network disabled');
+    if (noNetwork(url)) {
+      abort.abort('network disabled');
+      throw new Error('network disabled');
     }
     const body = new Uint8Array(await res.arrayBuffer());
     if (timeout !== undefined) clearTimeout(timeout);
