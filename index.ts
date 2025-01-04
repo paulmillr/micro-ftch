@@ -257,14 +257,18 @@ export class JsonrpcProvider implements JsonrpcInterface {
     if (json && json.error) throw this.jsonError(json.error);
     return json.result;
   }
-  call(method: string, ...args: any[]) {
+  call(method: string, ...args: any[]): Promise<any> {
     return this.rpc(method, args);
   }
-  callNamed(method: string, params: Record<string, any>) {
+  callNamed(method: string, params: Record<string, any>): Promise<any> {
     return this.rpc(method, params);
   }
 }
-export function jsonrpc(fetchFunction: FetchFn, rpcUrl: string, options: NetworkOpts = {}) {
+export function jsonrpc(
+  fetchFunction: FetchFn,
+  rpcUrl: string,
+  options: NetworkOpts = {}
+): JsonrpcProvider {
   return new JsonrpcProvider(fetchFunction, rpcUrl, options);
 }
 
@@ -381,6 +385,8 @@ export function replayable(
 }
 
 // Internal methods for test purposes only
-export const _TEST = /* @__PURE__ */ {
+export const _TEST: {
+  limit: typeof limit;
+} = /* @__PURE__ */ {
   limit,
 };
