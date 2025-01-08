@@ -2,7 +2,7 @@
 // Awaiting for promise is equal to node nextTick
 const nextTick = async () => {};
 // Small internal primitive to limit concurrency
-function limit(concurrencyLimit: number) {
+function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T> {
   let currentlyProcessing = 0;
   const queue: ((value?: unknown) => void)[] = [];
   const next = () => {
@@ -30,7 +30,7 @@ function limit(concurrencyLimit: number) {
 }
 
 // Fetch
-type FetchOpts = RequestInit & { timeout?: number };
+export type FetchOpts = RequestInit & { timeout?: number };
 export type FetchFn = (
   url: string,
   opts?: FetchOpts
