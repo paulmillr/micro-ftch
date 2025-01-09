@@ -59,6 +59,7 @@ function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T
     });
 }
 
+/** Arguments for built-in fetch, with added timeout method. */
 export type FetchOpts = RequestInit & { timeout?: number };
 
 /** Built-in fetch, or function conforming to its interface. */
@@ -87,6 +88,7 @@ export type FtchOpts = {
   timeout?: number;
   log?: (url: string, opts: FetchOpts) => void;
 };
+
 type UnPromise<T> = T extends Promise<infer U> ? U : T;
 // NOTE: we don't expose actual request to make sure there is no way to trigger actual network code
 // from wrapped function
@@ -226,9 +228,11 @@ type RpcError = { code: number; message: string };
  * @param [opts.headers] - additional headers to send with requests
  * @param [opts.batchSize] - batch parallel requests up to this value into single request
  * @example
+ * ```js
  * const rpc = new JsonrpcProvider(fetch, 'http://rpc_node/', { headers: {}, batchSize: 20 });
  * const res = await rpc.call('method', 'arg0', 'arg1');
  * const res2 = await rpc.callNamed('method', {arg0: '0', arg1: '1'}); // named arguments
+ * ```
  */
 export class JsonrpcProvider implements JsonrpcInterface {
   private batchSize: number;
@@ -332,12 +336,14 @@ export function jsonrpc(
 type GetKeyFn = (url: string, opt: FetchOpts) => string;
 const defaultGetKey: GetKeyFn = (url, opt) => JSON.stringify({ url, opt });
 
+/** Options for replayable() */
 export type ReplayOpts = {
   offline?: boolean; // throw on non-logged requests
   getKey?: GetKeyFn;
 };
 
-type ReplayFn = FetchFn & {
+/** replayable() return function, additional methods */
+export type ReplayFn = FetchFn & {
   logs: Record<string, any>;
   accessed: Set<string>;
   export: () => string;
@@ -377,17 +383,23 @@ const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
  * const replayCapture = replayable(ftch); // wraps fetch
  * await replayCapture('http://url/1');
  * const logs = replayCapture.export(); // Exports logs
+ * ```
  * @example
+ * ```js
  * // Replay logs
  * const replayTest = replayable(ftch, JSON.parse(logs));
  * await replayTest('http://url/1'); // cached
  * await replayTest('http://url/2'); // real network
+ * ```
  * @example
+ * ```js
  * // Offline mode
  * const replayTestOffline = replayable(ftch, JSON.parse(logs), { offline: true });
  * await replayTest('http://url/1'); // cached
  * await replayTest('http://url/2'); // throws!
+ * ```
  * @example
+ * ```js
  * // Custom log key function
  * const getKey = (url, opt) => JSON.stringify({ url: 'https://NODE_URL/', opt }); // use same url for any request
  * const replayCapture = replayable(ftch, {}, { getKey });
@@ -443,7 +455,7 @@ export function replayable(
   return wrapped;
 }
 
-// Internal methods for test purposes only
+/** Internal methods for test purposes only. */
 export const _TEST: {
   limit: typeof limit;
 } = /* @__PURE__ */ {
