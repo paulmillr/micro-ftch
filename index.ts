@@ -1,3 +1,33 @@
+/**
+ * Wrappers for [built-in fetch()](https://developer.mozilla.org/en-US/docs/Web/API/fetch) enabling
+ * killswitch, logging, concurrency limit and other features. fetch is great, however, its usage in secure environments is complicated. The library makes it simple.
+ * @module
+ * @example
+```js
+import { ftch, jsonrpc, replayable } from 'micro-ftch';
+
+let enabled = false;
+const net = ftch(fetch, {
+  killswitch: () => enabled,
+  log: (url, options) => console.log(url, options),
+  timeout: 5000,
+  concurrencyLimit: 10,
+});
+const res = await net('https://example.com');
+
+// Composable
+const rpc = jsonrpc(net, 'http://rpc_node/', {
+  headers: {},
+  batchSize: 20,
+});
+const res1 = await rpc.call('method', 'arg0', 'arg1');
+const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named arguments
+const testRpc = replayable(rpc);
+// Basic auth auto-parsing
+await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
+```
+ */
+
 // Utils
 // Awaiting for promise is equal to node nextTick
 const nextTick = async () => {};
