@@ -29,8 +29,9 @@ function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T
     });
 }
 
-// Fetch
 export type FetchOpts = RequestInit & { timeout?: number };
+
+/** Built-in fetch, or function conforming to its interface. */
 export type FetchFn = (
   url: string,
   opts?: FetchOpts
@@ -47,6 +48,7 @@ export type FetchFn = (
   arrayBuffer: () => Promise<ArrayBuffer>;
 }>;
 
+/** Options for `ftch`. killswitch can disable fetching, while log will receive all requests. */
 export type FtchOpts = {
   // TODO: killswitch => isValidRequest or beforeEach
   // maybe also pass options?
@@ -79,26 +81,38 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  * @param [opts.log] - Callback to log all requests
  * @returns Wrapped fetch function
  * @example
+ * ```js
  * let ENABLED = true;
  * const f = ftch(fetch, { killswitch: ()=>ENABLED });
  * f('http://localhost'); // ok
  * ENABLED = false;
  * f('http://localhost'); // throws
+ * ```
  * @example
+ * ```js
  * const f = ftch(fetch, { concurrencyLimit: 1 });
  * const res = await Promise.all([f('http://url1/'), f('http://url2/')]); // these would be processed sequentially
+ * ```
  * @example
+ * ```js
  * const f = ftch(fetch);
  * const res = await f('http://url/', { timeout: 1000 }); // throws if request takes more than one second
+ * ```
  * @example
+ * ```js
  * const f = ftch(fetch, { timeout: 1000 }); // default timeout for all requests
  * const res = await f('http://url/'); // throws if request takes more than one second
+ * ```
  * @example
+ * ```js
  * const f = ftch(fetch);
  * const res = await f('https://user:pwd@httpbin.org/basic-auth/user/pwd'); // basic auth
+ * ```
  * @example
+ * ```js
  * const f = ftch(fetch, { log: (url, opts)=>console.log('NET', url, opts) })
  * f('http://url/'); // will print request information
+ * ```
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
   if (opts.killswitch && typeof opts.killswitch !== 'function')
@@ -264,6 +278,19 @@ export class JsonrpcProvider implements JsonrpcInterface {
     return this.rpc(method, params);
   }
 }
+
+/**
+ * Batched JSON-RPC functionality.
+ * @example
+```js
+const rpc = jsonrpc(fetch, 'http://rpc_node/', {
+  headers: {},
+  batchSize: 20,
+});
+const res = await rpc.call('method', 'arg0', 'arg1');
+const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named arguments
+```
+ */
 export function jsonrpc(
   fetchFunction: FetchFn,
   rpcUrl: string,
@@ -307,13 +334,14 @@ const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
 };
 
 /**
- *
+ * Log & replay network requests without actually calling network code.
  * @param fetchFunction
  * @param logs - captured logs (JSON.parse(fetchReplay(...).export()))
  * @param opts
  * @param [opts.offline] - Offline mode, throws on non-captured requests
  * @param [opts.getKey] - Optional function to modify key information for capture/replay of requests
  * @example
+ * ```js
  * // Capture logs
  * const ftch = ftch(fetch);
  * const replayCapture = replayable(ftch); // wraps fetch
@@ -333,6 +361,7 @@ const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
  * // Custom log key function
  * const getKey = (url, opt) => JSON.stringify({ url: 'https://NODE_URL/', opt }); // use same url for any request
  * const replayCapture = replayable(ftch, {}, { getKey });
+ * ```
  */
 export function replayable(
   fetchFunction: FetchFn,
