@@ -458,6 +458,6 @@ export function replayable(
 /** Internal methods for test purposes only. */
 export const _TEST: {
   limit: typeof limit;
-} = /* @__PURE__ */ {
+} = {
   limit,
 };
