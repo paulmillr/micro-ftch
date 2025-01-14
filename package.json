@@ -18,7 +18,7 @@
   },
   "devDependencies": {
     "@paulmillr/jsbt": "0.2.1",
-    "micro-should": "0.4.0",
+    "micro-should": "0.5.0",
     "prettier": "3.3.2",
     "typescript": "5.5.2"
   },
@@ -34,7 +34,7 @@
     "build": "tsc && tsc -p tsconfig.esm.json",
     "lint": "prettier --check index.ts",
     "format": "prettier --write index.ts",
-    "test": "node test/index.test.js"
+    "test": "node test/index.js"
   },
   "keywords": [
     "fetch",

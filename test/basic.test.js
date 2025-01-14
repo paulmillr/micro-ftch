@@ -1,4 +1,5 @@
 import { deepStrictEqual, throws, rejects } from 'node:assert';
+import { Buffer } from 'node:buffer';
 import { describe, should } from 'micro-should';
 import { createServer } from 'node:http';
 import * as mftch from '../lib/esm/index.js';
@@ -523,8 +524,4 @@ describe('Network', () => {
   });
 });
 
-// ESM is broken.
-import url from 'node:url';
-if (import.meta.url === url.pathToFileURL(process.argv[1]).href) {
-  should.run();
-}
+should.runWhen(import.meta.url);
