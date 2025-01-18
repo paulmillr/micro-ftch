@@ -1,0 +1,9 @@
+{
+  "extends": "@paulmillr/jsbt/tsconfig.cjs.json",
+  "compilerOptions": {
+    "lib": ["es2019", "dom"],
+    "outDir": "lib"
+  },
+  "include": ["index.ts"],
+  "exclude": ["node_modules", "lib"]
+}
