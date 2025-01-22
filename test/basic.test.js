@@ -4,12 +4,10 @@ import { describe, should } from 'micro-should';
 import { createServer } from 'node:http';
 import * as mftch from '../lib/esm/index.js';
 
-const HTTP_PORT = 8001;
-const URL = `http://127.0.0.1:${HTTP_PORT}/`;
 // NOTE: this will send real network requests to httpbin (to verify compat)
 const REAL_NETWORK = false;
 
-function httpServer(cb) {
+function httpServer(port, cb) {
   const server = createServer(async (req, res) => {
     if (req.method !== 'POST' || req.headers['content-type'] !== 'application/json') {
       res.writeHead(405);
@@ -20,22 +18,39 @@ function httpServer(cb) {
     const buf = [];
     for await (const chunk of req) buf.push(chunk);
     const body = Buffer.concat(buf).toString('utf8');
-    res.end(JSON.stringify(await cb(JSON.parse(body), req.headers)));
+    const response = await cb(JSON.parse(body), req.headers);
+    res.end(JSON.stringify(response));
   });
   server.on('error', (err) => console.log('HTTP ERR', err));
   const stop = () =>
     new Promise((resolve, reject) => {
       server.close(async (err) => {
         await sleep(100); // this somehow broken, without it new server will throw ECONNRESET because old server not fully closed.
+        // also, bun will silently use old server even after stopping, so we use different ports for different tests
         if (err) reject(err);
         else resolve();
       });
       server.closeAllConnections();
     });
-  return new Promise((resolve) => server.listen(HTTP_PORT, (t) => resolve(stop)));
+  const url = `http://127.0.0.1:${port}/`;
+  return new Promise((resolve) => server.listen(port, (t) => resolve({ stop, url })));
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const cleanHeaders = (headers) => {
+  // these changes between node, bun and deno
+  const {
+    'accept-encoding': _0,
+    'sec-fetch-mode': _1,
+    'user-agent': _2,
+    connection: _3,
+    host: _4,
+    'accept-language': _5,
+    ...rest
+  } = headers;
+  return rest;
+};
 
 describe('Network', () => {
   describe('Limit', () => {
@@ -195,7 +210,7 @@ describe('Network', () => {
 
   should('ftch', async () => {
     const serverLog = [];
-    const stop = await httpServer(async (r) => {
+    const { stop, url } = await httpServer(8001, async (r) => {
       if (r.sleep) await sleep(r.sleep);
       serverLog.push(r.res);
       return { res: r.res };
@@ -214,7 +229,7 @@ describe('Network', () => {
       killswitch: () => ENABLED,
     });
     const t = async (fn, body, opts = {}) => {
-      const res = await fn(URL, {
+      const res = await fn(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -319,14 +334,14 @@ describe('Network', () => {
   });
   should('jsonrpc', async () => {
     const serverLog = [];
-    const stop = await httpServer(async (r, headers) => {
-      serverLog.push({ r, headers });
+    const { stop, url } = await httpServer(8002, async (r, headers) => {
+      serverLog.push({ r, headers: cleanHeaders(headers) });
       if (Array.isArray(r))
         return r.map((i) => (Array.isArray(i.params) ? i.params[0] : i.params.res));
       return Array.isArray(r.params) ? r.params[0] : r.params.res;
     });
     const f = mftch.ftch(fetch);
-    const rpc = mftch.jsonrpc(f, URL, {
+    const rpc = mftch.jsonrpc(f, url, {
       headers: { Test: '1' },
     });
     // Basic
@@ -350,15 +365,9 @@ describe('Network', () => {
           params: [{ jsonrpc: '2.0', id: 0, result: 1 }, 1, true, [1, 2, 3]],
         },
         headers: {
-          host: '127.0.0.1:8001',
-          connection: 'keep-alive',
           'content-type': 'application/json',
           test: '1',
           accept: '*/*',
-          'accept-language': '*',
-          'sec-fetch-mode': 'cors',
-          'user-agent': 'node',
-          'accept-encoding': 'gzip, deflate',
           'content-length': '101',
         },
       },
@@ -370,15 +379,9 @@ describe('Network', () => {
           params: { res: { jsonrpc: '2.0', id: 0, result: 1 }, A: 1 },
         },
         headers: {
-          host: '127.0.0.1:8001',
-          connection: 'keep-alive',
           'content-type': 'application/json',
           test: '1',
           accept: '*/*',
-          'accept-language': '*',
-          'sec-fetch-mode': 'cors',
-          'user-agent': 'node',
-          'accept-encoding': 'gzip, deflate',
           'content-length': '98',
         },
       },
@@ -390,22 +393,16 @@ describe('Network', () => {
           params: [{ jsonrpc: '2.0', id: 0, error: { code: 0, message: 'test' } }],
         },
         headers: {
-          host: '127.0.0.1:8001',
-          connection: 'keep-alive',
           'content-type': 'application/json',
           test: '1',
           accept: '*/*',
-          'accept-language': '*',
-          'sec-fetch-mode': 'cors',
-          'user-agent': 'node',
-          'accept-encoding': 'gzip, deflate',
           'content-length': '111',
         },
       },
     ]);
     serverLog.splice(0, serverLog.length);
     // Batch
-    const rpcBatch = mftch.jsonrpc(f, URL, {
+    const rpcBatch = mftch.jsonrpc(f, url, {
       headers: { Test: '1' },
       batchSize: 2,
     });
@@ -484,13 +481,13 @@ describe('Network', () => {
   });
   should('replayable', async () => {
     const serverLog = [];
-    const stop = await httpServer(async (r) => {
+    const { stop, url } = await httpServer(8003, async (r) => {
       if (r.sleep) await sleep(r.sleep);
       serverLog.push(r.res);
       return { res: r.res };
     });
     const t = async (fn, body, opts = {}) => {
-      const res = await fn(URL, {
+      const res = await fn(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -506,7 +503,7 @@ describe('Network', () => {
     const logs = replayCapture.export();
     deepStrictEqual(
       logs,
-      '{"{\\"url\\":\\"http://127.0.0.1:8001/\\",\\"opt\\":{\\"method\\":\\"POST\\",\\"headers\\":{\\"Content-Type\\":\\"application/json\\"},\\"body\\":\\"{\\\\\\"res\\\\\\":1}\\"}}":"{\\"res\\":1}","{\\"url\\":\\"http://127.0.0.1:8001/\\",\\"opt\\":{\\"method\\":\\"POST\\",\\"headers\\":{\\"Content-Type\\":\\"application/json\\"},\\"body\\":\\"{\\\\\\"res\\\\\\":2}\\"}}":"{\\"res\\":2}"}'
+      '{"{\\"url\\":\\"http://127.0.0.1:8003/\\",\\"opt\\":{\\"method\\":\\"POST\\",\\"headers\\":{\\"Content-Type\\":\\"application/json\\"},\\"body\\":\\"{\\\\\\"res\\\\\\":1}\\"}}":"{\\"res\\":1}","{\\"url\\":\\"http://127.0.0.1:8003/\\",\\"opt\\":{\\"method\\":\\"POST\\",\\"headers\\":{\\"Content-Type\\":\\"application/json\\"},\\"body\\":\\"{\\\\\\"res\\\\\\":2}\\"}}":"{\\"res\\":2}"}'
     );
     const replayTest = mftch.replayable(ftch, JSON.parse(logs));
     deepStrictEqual(await t(replayTest, { res: 1 }), { res: 1 });
