@@ -9,7 +9,9 @@ fetch is great, however, its usage in secure environments is complicated. The li
 A standalone file
 [micro-ftch.js](https://github.com/paulmillr/micro-ftch/releases) is also available.
 
-> npm install micro-ftch
+> `npm install micro-ftch`
+
+> `jsr add jsr:@paulmillr/micro-ftch`
 
 ```ts
 import { ftch, jsonrpc, replayable } from 'micro-ftch';
@@ -45,7 +47,6 @@ await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
 - [replayable](#replayable)
 - [Privacy](#privacy)
 - [License](#license)
-
 
 There are three wrappers over `fetch()`:
 
