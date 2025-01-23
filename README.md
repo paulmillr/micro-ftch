@@ -18,7 +18,7 @@ import { ftch, jsonrpc, replayable } from 'micro-ftch';
 
 let enabled = false;
 const net = ftch(fetch, {
-  killswitch: () => enabled,
+  isValidRequest: () => enabled,
   log: (url, options) => console.log(url, options),
   timeout: 5000,
   concurrencyLimit: 10,
@@ -38,7 +38,7 @@ await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
 ```
 
 - [ftch](#ftch)
-  - [killswitch](#killswitch)
+  - [isValidRequest](#isValidRequest)
   - [log](#log)
   - [timeout](#timeout)
   - [concurrencyLimit](#concurrencyLimit)
@@ -50,7 +50,7 @@ await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
 
 There are three wrappers over `fetch()`:
 
-1. `ftch(fetch)` - killswitch, logging, timeouts, concurrency limits, basic auth
+1. `ftch(fetch)` - isValidRequest, logging, timeouts, concurrency limits, basic auth
 2. `jsonrpc(fetch)` - batched JSON-RPC functionality
 3. `replayable(fetch)` - log & replay network requests without actually calling network code.
 
@@ -58,14 +58,14 @@ There are three wrappers over `fetch()`:
 
 Basic wrapper over `fetch()`.
 
-### killswitch
+### isValidRequest
 
-When kill-switch is enabled, all requests will throw an error.
+When isValidRequest killswitch is enabled, all requests will throw an error.
 You can dynamically enable and disable it any any time.
 
 ```ts
 let ENABLED = true;
-const f = ftch(fetch, { killswitch: () => ENABLED });
+const f = ftch(fetch, { isValidRequest: () => ENABLED });
 f('http://localhost'); // ok
 ENABLED = false;
 f('http://localhost'); // throws

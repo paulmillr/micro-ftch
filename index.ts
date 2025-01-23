@@ -79,10 +79,9 @@ export type FetchFn = (
   arrayBuffer: () => Promise<ArrayBuffer>;
 }>;
 
-/** Options for `ftch`. killswitch can disable fetching, while log will receive all requests. */
+/** Options for `ftch`. isValidRequest can disable fetching, while log will receive all requests. */
 export type FtchOpts = {
-  // TODO: killswitch => isValidRequest or beforeEach
-  // maybe also pass options?
+  isValidRequest?: (url?: string) => boolean;
   killswitch?: (url?: string) => boolean;
   concurrencyLimit?: number;
   timeout?: number;
@@ -107,7 +106,7 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  *
  * @param fn - The fetch function to be wrapped.
  * @param opts - Options to control the behavior of the fetch wrapper.
- * @param [opts.killswitch] - Function to determine if the fetch request should be cancelled.
+ * @param [opts.isValidRequest] - Function to determine if the fetch request should be cancelled.
  * @param [opts.concurrencyLimit] - Limit on the number of concurrent fetch requests.
  * @param [opts.timeout] - Default timeout for all requests, can be overriden in request opts
  * @param [opts.log] - Callback to log all requests
@@ -115,7 +114,7 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  * @example
  * ```js
  * let ENABLED = true;
- * const f = ftch(fetch, { killswitch: ()=>ENABLED });
+ * const f = ftch(fetch, { isValidRequest: () => ENABLED });
  * f('http://localhost'); // ok
  * ENABLED = false;
  * f('http://localhost'); // throws
@@ -147,9 +146,9 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  * ```
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
-  if (opts.killswitch && typeof opts.killswitch !== 'function')
-    throw new Error('opts.killswitch must be a function');
-  const noNetwork = (url: string) => opts.killswitch && !opts.killswitch(url);
+  const ks = opts.isValidRequest || opts.killswitch;
+  if (ks && typeof ks !== 'function') throw new Error('opts.killswitch must be a function');
+  const noNetwork = (url: string) => ks && !ks(url);
   const wrappedFetch: FetchFn = async (url, reqOpts = {}) => {
     if (opts.log) opts.log(url, reqOpts);
     const abort = new AbortController();
