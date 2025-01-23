@@ -1,6 +1,6 @@
 {
   "name": "@paulmillr/micro-ftch",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "exports": "./index.ts",
   "publish": {
     "include": [
