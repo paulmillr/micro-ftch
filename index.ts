@@ -8,7 +8,7 @@ import { ftch, jsonrpc, replayable } from 'micro-ftch';
 
 let enabled = false;
 const net = ftch(fetch, {
-  killswitch: () => enabled,
+  isValidRequest: () => enabled,
   log: (url, options) => console.log(url, options),
   timeout: 5000,
   concurrencyLimit: 10,
@@ -147,10 +147,9 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
   const ks = opts.isValidRequest || opts.killswitch;
-  if (ks && typeof ks !== 'function') throw new Error('opts.killswitch must be a function');
+  if (ks && typeof ks !== 'function') throw new Error('opts.isValidRequest must be a function');
   const noNetwork = (url: string) => ks && !ks(url);
   const wrappedFetch: FetchFn = async (url, reqOpts = {}) => {
-    if (opts.log) opts.log(url, reqOpts);
     const abort = new AbortController();
     let timeout = undefined;
     if (opts.timeout !== undefined || reqOpts.timeout !== undefined) {
@@ -171,6 +170,7 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       h.forEach((v, k) => headers.set(k, v));
     }
     if (noNetwork(url)) throw new Error('network disabled');
+    if (opts.log) opts.log(url, reqOpts);
     const res = await fetchFunction(url, {
       referrerPolicy: 'no-referrer', // avoid sending referrer by default
       ...reqOpts,
@@ -237,13 +237,13 @@ export class JsonrpcProvider implements JsonrpcInterface {
   private batchSize: number;
   private headers: Record<string, string>;
   private queue: ({ method: string; params: RpcParams } & PromiseCb<any>)[] = [];
-  constructor(
-    private fetchFunction: FetchFn,
-    readonly rpcUrl: string,
-    options: NetworkOpts = {}
-  ) {
+  private fetchFunction: FetchFn;
+  readonly rpcUrl: string;
+  constructor(fetchFunction: FetchFn, rpcUrl: string, options: NetworkOpts = {}) {
     if (typeof fetchFunction !== 'function') throw new Error('fetchFunction is required');
     if (typeof rpcUrl !== 'string') throw new Error('rpcUrl is required');
+    this.fetchFunction = fetchFunction;
+    this.rpcUrl = rpcUrl;
     this.batchSize = options.batchSize === undefined ? 1 : options.batchSize;
     this.headers = options.headers || {};
     if (typeof this.headers !== 'object') throw new Error('invalid headers: expected object');
