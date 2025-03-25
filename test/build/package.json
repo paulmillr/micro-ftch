@@ -5,7 +5,7 @@
   "main": "input.js",
   "type": "module",
   "devDependencies": {
-    "micro-ftch": "file:../..",
-    "esbuild": "0.24.2"
+    "esbuild": "0.25.0",
+    "micro-ftch": "file:../.."
   }
 }
