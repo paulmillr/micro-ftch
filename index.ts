@@ -261,29 +261,39 @@ export class JsonrpcProvider implements JsonrpcInterface {
   }
   private async batchProcess() {
     await nextTick(); // this allows to collect as much requests as we can in single tick
-    const cur = this.queue.splice(0, this.batchSize);
-    if (!cur.length) return;
+    const curr = this.queue.splice(0, this.batchSize);
+    if (!curr.length) return;
     const json = await this.fetchJson(
-      cur.map((i, j) => ({
+      curr.map((i, j) => ({
         jsonrpc: '2.0',
         id: j,
         method: i.method,
         params: i.params,
       }))
     );
+    if (!Array.isArray(json)) {
+      const hasMsg = json.code && json.message;
+      curr.forEach((req, index) => {
+        const err = hasMsg
+          ? this.jsonError(json)
+          : new Error('invalid response in batch request ' + index);
+        req.reject(err);
+      });
+      return;
+    }
     const processed = new Set();
     for (const res of json) {
       // Server sent broken ids. We cannot throw error here, since we will have unresolved promises
       // Also, this will break app state.
-      if (!Number.isSafeInteger(res.id) || res.id < 0 || res.id >= cur.length) continue;
+      if (!Number.isSafeInteger(res.id) || res.id < 0 || res.id >= curr.length) continue;
       if (processed.has(res.id)) continue; // multiple responses for same id
-      const { reject, resolve } = cur[res.id];
+      const { reject, resolve } = curr[res.id];
       processed.add(res.id);
       if (res && res.error) reject(this.jsonError(res.error));
       else resolve(res.result);
     }
-    for (let i = 0; i < cur.length; i++) {
-      if (!processed.has(i)) cur[i].reject(new Error(`response missing in batch request`));
+    for (let i = 0; i < curr.length; i++) {
+      if (!processed.has(i)) curr[i].reject(new Error(`response missing in batch request ` + i));
     }
   }
   private rpcBatch(method: string, params: RpcParams) {
