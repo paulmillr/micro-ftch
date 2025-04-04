@@ -217,7 +217,16 @@ type NetworkOpts = {
 };
 
 type RpcParams = any[] | Record<string, any>;
-type RpcError = { code: number; message: string };
+type RpcErrorResponse = { code: number; message: string };
+
+export class RpcError extends Error {
+  readonly code: number;
+  constructor(error: RpcErrorResponse) {
+    super(`FetchProvider(${error.code}): ${error.message || error}`);
+    this.code = error.code;
+    this.name = 'RpcError';
+  }
+}
 
 /**
  * Small utility class for Jsonrpc
@@ -256,8 +265,8 @@ export class JsonrpcProvider implements JsonrpcInterface {
     });
     return await res.json();
   }
-  private jsonError(error: RpcError) {
-    return new Error(`FetchProvider(${error.code}): ${error.message || error}`);
+  private jsonError(error: RpcErrorResponse) {
+    return new RpcError(error);
   }
   private async batchProcess() {
     await nextTick(); // this allows to collect as much requests as we can in single tick
