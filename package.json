@@ -45,6 +45,7 @@
     "concurrent",
     "parallel",
     "jsonrpc",
+    "micro",
     "replay",
     "ftch"
   ],
