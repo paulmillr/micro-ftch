@@ -1,8 +1,8 @@
-import { deepStrictEqual, throws, rejects } from 'node:assert';
-import { Buffer } from 'node:buffer';
 import { describe, should } from 'micro-should';
+import { deepStrictEqual, rejects } from 'node:assert';
+import { Buffer } from 'node:buffer';
 import { createServer } from 'node:http';
-import * as mftch from '../lib/esm/index.js';
+import * as mftch from '../index.ts';
 
 // NOTE: this will send real network requests to httpbin (to verify compat)
 const REAL_NETWORK = false;
