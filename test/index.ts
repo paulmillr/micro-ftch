@@ -1,5 +1,5 @@
 import { should } from 'micro-should';
 
-import './basic.test.js';
+import './basic.test.ts';
 
 should.run(true);

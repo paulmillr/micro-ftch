@@ -3,25 +3,19 @@
   "version": "0.4.3",
   "description": "Wrappers for built-in fetch() enabling killswitch, logging, concurrency limit and other features",
   "files": [
-    "lib",
+    "index.js",
+    "index.js.map",
+    "index.d.ts",
+    "index.d.ts.map",
     "index.ts"
   ],
-  "main": "./lib/index.js",
-  "module": "./lib/esm/index.js",
-  "types": "./lib/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./lib/index.d.ts",
-      "import": "./lib/esm/index.js",
-      "default": "./lib/index.js"
-    }
-  },
   "devDependencies": {
-    "@paulmillr/jsbt": "0.4.0",
-    "micro-bmark": "0.4.0",
+    "@paulmillr/jsbt": "0.4.1",
+    "@types/node": "22.15.23",
+    "micro-bmark": "0.4.1",
     "micro-should": "0.5.3",
     "prettier": "3.5.2",
-    "typescript": "5.8.2"
+    "typescript": "5.8.3"
   },
   "sideEffects": false,
   "author": "Paul Miller (https://paulmillr.com)",
@@ -31,14 +25,18 @@
     "type": "git",
     "url": "git+https://github.com/paulmillr/micro-ftch.git"
   },
+  "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "types": "./index.d.ts",
   "scripts": {
-    "build": "tsc && tsc -p tsconfig.cjs.json",
+    "build": "tsc",
     "build:release": "npx jsbt esbuild test/build",
     "lint": "prettier --check index.ts",
     "format": "prettier --write index.ts",
-    "test": "node test/index.js",
-    "test:bun": "bun test/index.js",
-    "test:deno": "deno --allow-env --allow-net test/index.js"
+    "test": "node --experimental-strip-types --no-warnings test/index.ts",
+    "test:bun": "bun test/index.ts",
+    "test:deno": "deno --allow-env --allow-net test/index.ts"
   },
   "keywords": [
     "fetch",
