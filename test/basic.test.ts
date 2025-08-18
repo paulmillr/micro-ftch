@@ -1,4 +1,4 @@
-import { describe, should } from 'micro-should';
+import { describe, should } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual, rejects } from 'node:assert';
 import { Buffer } from 'node:buffer';
 import { createServer } from 'node:http';
