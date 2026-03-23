@@ -16,7 +16,7 @@ A standalone file
 ```ts
 import { ftch, jsonrpc, replayable } from 'micro-ftch';
 
-let enabled = false;
+let enabled = true;
 const net = ftch(fetch, {
   isValidRequest: () => enabled,
   log: (url, options) => console.log(url, options),
@@ -32,7 +32,9 @@ const rpc = jsonrpc(net, 'http://rpc_node/', {
 });
 const res1 = await rpc.call('method', 'arg0', 'arg1');
 const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named arguments
-const testRpc = replayable(rpc);
+const replayNet = replayable(net);
+const replayRpc = jsonrpc(replayNet, 'http://rpc_node/', { headers: {}, batchSize: 20 });
+const replayRes = await replayRpc.call('method', 'arg0', 'arg1');
 // Basic auth auto-parsing
 await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
 ```
@@ -64,6 +66,8 @@ When isValidRequest killswitch is enabled, all requests will throw an error.
 You can dynamically enable and disable it any any time.
 
 ```ts
+import { ftch } from 'micro-ftch';
+
 let ENABLED = true;
 const f = ftch(fetch, { isValidRequest: () => ENABLED });
 f('http://localhost'); // ok
@@ -76,6 +80,8 @@ f('http://localhost'); // ok
 ### log
 
 ```ts
+import { ftch } from 'micro-ftch';
+
 const f = ftch(fetch, { log: (url, opts) => console.log('fetching', url, opts) });
 f('http://url/'); // will print request information
 ```
@@ -83,14 +89,16 @@ f('http://url/'); // will print request information
 ### timeout
 
 ```ts
+import { ftch } from 'micro-ftch';
+
 // browser and OS may have additional timeouts, we cannot override them
 // a: per-request timeout
 const f = ftch(fetch);
 const res = await f('http://url/', { timeout: 1000 }); // throws if request takes more than one second
 
 // b: timeout for all
-const f = ftch(fetch, { timeout: 1000 });
-const res = await f('http://url/'); // throws if request takes more than one second
+const f2 = ftch(fetch, { timeout: 1000 });
+const res2 = await f2('http://url/'); // throws if request takes more than one second
 ```
 
 ### concurrencyLimit
@@ -98,6 +106,8 @@ const res = await f('http://url/'); // throws if request takes more than one sec
 Allows to not accidentally hit rate limits or do DoS.
 
 ```ts
+import { ftch } from 'micro-ftch';
+
 // browser and OS may have additional limits, we cannot override them
 const f = ftch(fetch, { concurrencyLimit: 1 });
 const res = await Promise.all([f('http://url1/'), f('http://url2/')]); // these would be processed sequentially
@@ -106,6 +116,8 @@ const res = await Promise.all([f('http://url1/'), f('http://url2/')]); // these 
 ### Basic auth
 
 ```ts
+import { ftch } from 'micro-ftch';
+
 const f = ftch(fetch);
 const res = await f('https://user:pwd@httpbin.org/basic-auth/user/pwd'); // supports basic auth!
 ```
@@ -115,6 +127,8 @@ const res = await f('https://user:pwd@httpbin.org/basic-auth/user/pwd'); // supp
 Supports batching multiple HTTP requests into one "Batched" JSON RPC HTTP request. Can massively speed-up when servers are single-threaded, has small per-user limits
 
 ```ts
+import { jsonrpc } from 'micro-ftch';
+
 const rpc = jsonrpc(fetch, 'http://rpc_node/', {
   headers: {},
   batchSize: 20,
@@ -128,7 +142,9 @@ const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named a
 Small utility to log & replay network requests in tests, without actually calling network code.
 
 ```ts
-const ftch = ftch(fetch);
+import { ftch as createFtch, replayable } from 'micro-ftch';
+
+const ftch = createFtch(fetch);
 const replayCapture = replayable(ftch); // wraps fetch
 await replayCapture('http://url/1'); // real network
 await replayCapture('http://url/2');
@@ -144,9 +160,9 @@ await replayTest('http://url/3'); // real network
 const replayTestOffline = replayable(ftch, JSON.parse(logs), {
   offline: true,
 });
-await replayTest('http://url/1'); // cached
-await replayTest('http://url/2'); // cached
-await replayTest('http://url/3'); // throws!
+await replayTestOffline('http://url/1'); // cached
+await replayTestOffline('http://url/2'); // cached
+await replayTestOffline('http://url/3'); // throws!
 ```
 
 ## Privacy

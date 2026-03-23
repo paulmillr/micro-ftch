@@ -519,6 +519,32 @@ describe('Network', () => {
     deepStrictEqual(serverLog, [1, 2, 3]);
     await stop();
   });
+  should('replayable without request opts', async () => {
+    const fetchFn: mftch.FetchFn = async (url, opts = {}) => {
+      const body = JSON.stringify({ url, method: opts.method || 'GET' });
+      return {
+        headers: new Headers(),
+        ok: true,
+        redirected: false,
+        status: 200,
+        statusText: 'OK',
+        type: 'basic',
+        url,
+        json: async () => JSON.parse(body),
+        text: async () => body,
+        arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+      };
+    };
+    const replay = mftch.replayable(fetchFn);
+    deepStrictEqual(await (await replay('https://example.com')).json(), {
+      url: 'https://example.com',
+      method: 'GET',
+    });
+    deepStrictEqual(replay.logs, {
+      '{"url":"https://example.com","opt":{"headers":{}}}':
+        '{"url":"https://example.com","method":"GET"}',
+    });
+  });
 });
 
 should.runWhen(import.meta.url);

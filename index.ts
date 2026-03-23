@@ -1,31 +1,39 @@
 /**
- * Wrappers for [built-in fetch()](https://developer.mozilla.org/en-US/docs/Web/API/fetch) enabling
- * killswitch, logging, concurrency limit and other features. fetch is great, however, its usage in secure environments is complicated. The library makes it simple.
+ * Wrappers for {@link https://developer.mozilla.org/en-US/docs/Web/API/fetch | built-in fetch()} enabling
+ * killswitch, logging, concurrency limit, and other features. Fetch is great, but its usage in secure
+ * environments is complicated. The library makes it simple.
  * @module
  * @example
-```js
-import { ftch, jsonrpc, replayable } from 'micro-ftch';
-
-let enabled = false;
-const net = ftch(fetch, {
-  isValidRequest: () => enabled,
-  log: (url, options) => console.log(url, options),
-  timeout: 5000,
-  concurrencyLimit: 10,
-});
-const res = await net('https://example.com');
-
-// Composable
-const rpc = jsonrpc(net, 'http://rpc_node/', {
-  headers: {},
-  batchSize: 20,
-});
-const res1 = await rpc.call('method', 'arg0', 'arg1');
-const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named arguments
-const testRpc = replayable(rpc);
-// Basic auth auto-parsing
-await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
-```
+ * Wrap fetch once, then compose JSON-RPC batching and replay support on top.
+ * ```js
+ * import { ftch, jsonrpc, replayable } from 'micro-ftch';
+ *
+ * let enabled = true;
+ * const events = [];
+ * const net = ftch(fetch, {
+ *   isValidRequest: () => enabled,
+ *   log: (url, options) => events.push({ url, method: options.method }),
+ *   timeout: 5000,
+ *   concurrencyLimit: 10,
+ * });
+ * const res = await net('https://example.com');
+ *
+ * const rpc = jsonrpc(net, 'http://rpc_node/', {
+ *   headers: {},
+ *   batchSize: 20,
+ * });
+ * const res1 = await rpc.call('method', 'arg0', 'arg1');
+ * const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' });
+ *
+ * const replayNet = replayable(net);
+ * const replayRpc = jsonrpc(replayNet, 'http://rpc_node/', {
+ *   headers: {},
+ *   batchSize: 20,
+ * });
+ * const replayRes = await replayRpc.call('method', 'arg0', 'arg1');
+ *
+ * await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
+ * ```
  */
 
 // Utils
@@ -59,10 +67,16 @@ function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T
     });
 }
 
-/** Arguments for built-in fetch, with added timeout method. */
-export type FetchOpts = RequestInit & { timeout?: number };
+/** Arguments for built-in fetch, with added timeout support. */
+export type FetchOpts = RequestInit & {
+  /** Abort the request after this many milliseconds. */
+  timeout?: number;
+};
 
-/** Built-in fetch, or function conforming to its interface. */
+/**
+ * Built-in fetch, or function conforming to its interface.
+ * Shared by `ftch`, `jsonrpc`, and `replayable`.
+ */
 export type FetchFn = (
   url: string,
   opts?: FetchOpts
@@ -79,12 +93,29 @@ export type FetchFn = (
   arrayBuffer: () => Promise<ArrayBuffer>;
 }>;
 
-/** Options for `ftch`. isValidRequest can disable fetching, while log will receive all requests. */
+/** Options for `ftch`. */
 export type FtchOpts = {
+  /**
+   * Returns `false` to block a request before or after it runs.
+   * @param url - Request URL about to be fetched.
+   * @returns `true` when the request should be allowed.
+   */
   isValidRequest?: (url?: string) => boolean;
+  /**
+   * Alias for `isValidRequest`.
+   * @param url - Request URL about to be fetched.
+   * @returns `true` when the request should be allowed.
+   */
   killswitch?: (url?: string) => boolean;
+  /** Maximum number of wrapped requests allowed to run at once. */
   concurrencyLimit?: number;
+  /** Default timeout in milliseconds for wrapped requests. */
   timeout?: number;
+  /**
+   * Observes every request before it is sent.
+   * @param url - Request URL.
+   * @param opts - Request options passed to the wrapped fetch. See {@link FetchOpts}.
+   */
   log?: (url: string, opts: FetchOpts) => void;
 };
 
@@ -103,46 +134,49 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
 
 /**
  * Small wrapper over fetch function
- *
- * @param fn - The fetch function to be wrapped.
- * @param opts - Options to control the behavior of the fetch wrapper.
- * @param [opts.isValidRequest] - Function to determine if the fetch request should be cancelled.
- * @param [opts.concurrencyLimit] - Limit on the number of concurrent fetch requests.
- * @param [opts.timeout] - Default timeout for all requests, can be overriden in request opts
- * @param [opts.log] - Callback to log all requests
- * @returns Wrapped fetch function
+ * @param fetchFunction - Fetch implementation to wrap.
+ * @param opts - Wrapper configuration like timeout, killswitch, and logging. See {@link FtchOpts}.
+ * @returns Wrapped fetch function with timeout, auth parsing, and optional request gating.
+ * @throws If the killswitch hook is invalid or a wrapped request is blocked by the network policy. {@link Error}
  * @example
+ * Add a simple network killswitch around an existing fetch implementation.
  * ```js
- * let ENABLED = true;
- * const f = ftch(fetch, { isValidRequest: () => ENABLED });
- * f('http://localhost'); // ok
- * ENABLED = false;
- * f('http://localhost'); // throws
+ * import { ftch } from 'micro-ftch';
+ * let enabled = true;
+ * const net = ftch(fetch, { isValidRequest: () => enabled });
+ * await net('https://example.com');
+ * enabled = false;
  * ```
  * @example
+ * Force wrapped requests to run one at a time.
  * ```js
- * const f = ftch(fetch, { concurrencyLimit: 1 });
- * const res = await Promise.all([f('http://url1/'), f('http://url2/')]); // these would be processed sequentially
+ * import { ftch } from 'micro-ftch';
+ * const net = ftch(fetch, { concurrencyLimit: 1 });
+ * await Promise.all([net('https://example.com/1'), net('https://example.com/2')]);
  * ```
  * @example
+ * Apply the same timeout to every request made through the wrapper.
  * ```js
- * const f = ftch(fetch);
- * const res = await f('http://url/', { timeout: 1000 }); // throws if request takes more than one second
+ * import { ftch } from 'micro-ftch';
+ * const net = ftch(fetch, { timeout: 1000 });
+ * await net('https://example.com');
  * ```
  * @example
+ * Capture a structured request log without changing the call sites.
  * ```js
- * const f = ftch(fetch, { timeout: 1000 }); // default timeout for all requests
- * const res = await f('http://url/'); // throws if request takes more than one second
+ * import { ftch } from 'micro-ftch';
+ * const events = [];
+ * const net = ftch(fetch, {
+ *   log: (url, options) => events.push({ url, method: options.method }),
+ * });
+ * await net('https://example.com');
  * ```
  * @example
+ * User info in the URL becomes the Authorization header automatically.
  * ```js
- * const f = ftch(fetch);
- * const res = await f('https://user:pwd@httpbin.org/basic-auth/user/pwd'); // basic auth
- * ```
- * @example
- * ```js
- * const f = ftch(fetch, { log: (url, opts)=>console.log('NET', url, opts) })
- * f('http://url/'); // will print request information
+ * import { ftch } from 'micro-ftch';
+ * const net = ftch(fetch);
+ * await net('https://user:pwd@example.com/private');
  * ```
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
@@ -206,8 +240,21 @@ type PromiseCb<T> = {
   reject: (reason?: any) => void;
 };
 
+/** Minimal JSON-RPC client interface. */
 export type JsonrpcInterface = {
+  /**
+   * Calls a JSON-RPC method with positional parameters.
+   * @param method - JSON-RPC method name.
+   * @param args - Positional JSON-RPC params.
+   * @returns Decoded JSON-RPC result.
+   */
   call: (method: string, ...args: any[]) => Promise<any>;
+  /**
+   * Calls a JSON-RPC method with named parameters.
+   * @param method - JSON-RPC method name.
+   * @param args - Named JSON-RPC params.
+   * @returns Decoded JSON-RPC result.
+   */
   callNamed: (method: string, args: Record<string, any>) => Promise<any>;
 };
 
@@ -219,6 +266,17 @@ type NetworkOpts = {
 type RpcParams = any[] | Record<string, any>;
 type RpcErrorResponse = { code: number; message: string };
 
+/**
+ * JSON-RPC server error wrapper.
+ * @param error - JSON-RPC error payload.
+ * @example
+ * Inspect the JSON-RPC error code and message from a failed response.
+ * ```js
+ * import { RpcError } from 'micro-ftch';
+ * const err = new RpcError({ code: -32000, message: 'oops' });
+ * console.log(err.code, err.message);
+ * ```
+ */
 export class RpcError extends Error {
   readonly code: number;
   constructor(error: RpcErrorResponse) {
@@ -230,16 +288,19 @@ export class RpcError extends Error {
 
 /**
  * Small utility class for Jsonrpc
- * @param fetchFunction - The fetch function
- * @param url - The RPC server url
- * @param opts - Options to control the behavior of RPC client
- * @param [opts.headers] - additional headers to send with requests
- * @param [opts.batchSize] - batch parallel requests up to this value into single request
+ * @param fetchFunction - Fetch implementation used for transport.
+ * @param rpcUrl - JSON-RPC endpoint URL.
+ * @param options - Batching and header configuration. See {@link NetworkOpts}.
  * @example
+ * Create a batched JSON-RPC client and call it with positional and named params.
  * ```js
- * const rpc = new JsonrpcProvider(fetch, 'http://rpc_node/', { headers: {}, batchSize: 20 });
+ * import { JsonrpcProvider } from 'micro-ftch';
+ * const rpc = new JsonrpcProvider(fetch, 'http://rpc_node/', {
+ *   headers: {},
+ *   batchSize: 20,
+ * });
  * const res = await rpc.call('method', 'arg0', 'arg1');
- * const res2 = await rpc.callNamed('method', {arg0: '0', arg1: '1'}); // named arguments
+ * const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' });
  * ```
  */
 export class JsonrpcProvider implements JsonrpcInterface {
@@ -333,15 +394,21 @@ export class JsonrpcProvider implements JsonrpcInterface {
 
 /**
  * Batched JSON-RPC functionality.
+ * @param fetchFunction - Fetch implementation used for transport.
+ * @param rpcUrl - JSON-RPC endpoint URL.
+ * @param options - Batching and header configuration. See {@link NetworkOpts}.
+ * @returns Configured JSON-RPC provider.
  * @example
-```js
-const rpc = jsonrpc(fetch, 'http://rpc_node/', {
-  headers: {},
-  batchSize: 20,
-});
-const res = await rpc.call('method', 'arg0', 'arg1');
-const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' }); // named arguments
-```
+ * Create a batched JSON-RPC helper.
+ * ```js
+ * import { jsonrpc } from 'micro-ftch';
+ * const rpc = jsonrpc(fetch, 'http://rpc_node/', {
+ *   headers: {},
+ *   batchSize: 20,
+ * });
+ * const res = await rpc.call('method', 'arg0', 'arg1');
+ * const res2 = await rpc.callNamed('method', { arg0: '0', arg1: '1' });
+ * ```
  */
 export function jsonrpc(
   fetchFunction: FetchFn,
@@ -351,19 +418,33 @@ export function jsonrpc(
   return new JsonrpcProvider(fetchFunction, rpcUrl, options);
 }
 
+/**
+ * Builds a replay bucket key from the request URL and fetch options.
+ * @param url - Request URL.
+ * @param opt - Fetch options used for the request.
+ * @returns Stable string key used for capture and replay.
+ */
 type GetKeyFn = (url: string, opt: FetchOpts) => string;
 const defaultGetKey: GetKeyFn = (url, opt) => JSON.stringify({ url, opt });
 
-/** Options for replayable() */
+/** Options for replayable(). */
 export type ReplayOpts = {
-  offline?: boolean; // throw on non-logged requests
+  /** Throw instead of using the wrapped fetch when a request is missing from the log. */
+  offline?: boolean;
+  /** Custom request-key function used for capture and replay. */
   getKey?: GetKeyFn;
 };
 
-/** replayable() return function, additional methods */
+/** replayable() return function, with additional logging helpers. */
 export type ReplayFn = FetchFn & {
+  /** Captured request/response payloads keyed by the replay fingerprint. */
   logs: Record<string, any>;
+  /** Keys that have been read or written through this replay wrapper. */
   accessed: Set<string>;
+  /**
+   * Exports only the log entries touched through this wrapper.
+   * @returns JSON string that can seed another `replayable()` instance.
+   */
   export: () => string;
 };
 
@@ -389,38 +470,54 @@ const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
 
 /**
  * Log & replay network requests without actually calling network code.
- * @param fetchFunction
- * @param logs - captured logs (JSON.parse(fetchReplay(...).export()))
- * @param opts
- * @param [opts.offline] - Offline mode, throws on non-captured requests
- * @param [opts.getKey] - Optional function to modify key information for capture/replay of requests
+ * @param fetchFunction - Wrapped fetch implementation used to capture new responses.
+ * @param logs - Captured request/response map, usually from `JSON.parse(replay.export())`.
+ * @param opts - Replay configuration such as offline mode or custom keying. See {@link ReplayOpts}.
+ * @returns Fetch-compatible wrapper with log export helpers.
  * @example
+ * Record live responses once, then export the captured log.
  * ```js
- * // Capture logs
- * const ftch = ftch(fetch);
- * const replayCapture = replayable(ftch); // wraps fetch
- * await replayCapture('http://url/1');
- * const logs = replayCapture.export(); // Exports logs
+ * import { ftch as createFtch, replayable } from 'micro-ftch';
+ * const ftch = createFtch(fetch);
+ * const replayCapture = replayable(ftch);
+ * await replayCapture('https://example.com/1');
+ * await replayCapture('https://example.com/2');
+ * const logs = replayCapture.export();
  * ```
  * @example
+ * Replay cached responses from a previously exported log snapshot.
  * ```js
- * // Replay logs
- * const replayTest = replayable(ftch, JSON.parse(logs));
- * await replayTest('http://url/1'); // cached
- * await replayTest('http://url/2'); // real network
+ * import { ftch as createFtch, replayable } from 'micro-ftch';
+ * const ftch = createFtch(fetch);
+ * const logs = { '{"method":"GET"}': '{"ok":true}' };
+ * const replay = replayable(ftch, logs, {
+ *   offline: true,
+ *   getKey: (_url, opt = {}) => JSON.stringify({ method: opt.method || 'GET' }),
+ * });
+ * await replay('https://example.com/1');
  * ```
  * @example
+ * Offline mode throws instead of making a new request.
  * ```js
- * // Offline mode
- * const replayTestOffline = replayable(ftch, JSON.parse(logs), { offline: true });
- * await replayTest('http://url/1'); // cached
- * await replayTest('http://url/2'); // throws!
+ * import { ftch as createFtch, replayable } from 'micro-ftch';
+ * const ftch = createFtch(fetch);
+ * const logs = { '{"url":"https://example.com/1","opt":{"headers":{}}}': '{"ok":true}' };
+ * const replayTestOffline = replayable(ftch, logs, { offline: true });
+ * await replayTestOffline('https://example.com/1');
  * ```
  * @example
- * ```js
- * // Custom log key function
- * const getKey = (url, opt) => JSON.stringify({ url: 'https://NODE_URL/', opt }); // use same url for any request
- * const replayCapture = replayable(ftch, {}, { getKey });
+ * Collapse multiple URLs into one replay bucket when the HTTP method is what matters.
+ * ```ts
+ * import { ftch as createFtch, replayable, type FetchOpts } from 'micro-ftch';
+ * const ftch = createFtch(fetch);
+ * const getKey = (_url: string, opt: FetchOpts = {}) =>
+ *   JSON.stringify({ method: opt.method || 'GET' });
+ * const replay = replayable(
+ *   ftch,
+ *   { '{"method":"GET"}': '{"ok":true}' },
+ *   { getKey, offline: true }
+ * );
+ * await replay('https://example.com/1', { method: 'GET' });
  * ```
  */
 export function replayable(
@@ -429,7 +526,7 @@ export function replayable(
   opts: ReplayOpts = {}
 ): ReplayFn {
   const accessed: Set<string> = new Set();
-  const wrapped = async (url: string, reqOpts: any) => {
+  const wrapped = async (url: string, reqOpts: FetchOpts = {}) => {
     const key = getKey(url, reqOpts, opts.getKey);
     accessed.add(key);
     if (!logs[key]) {
