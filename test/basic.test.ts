@@ -1,5 +1,5 @@
 import { describe, should } from '@paulmillr/jsbt/test.js';
-import { deepStrictEqual, rejects } from 'node:assert';
+import { deepStrictEqual, rejects, throws } from 'node:assert';
 import { Buffer } from 'node:buffer';
 import { createServer } from 'node:http';
 import * as mftch from '../index.ts';
@@ -123,6 +123,16 @@ describe('Network', () => {
       const p5 = await limit1(() => delayed(3, 10, log));
       deepStrictEqual(p5, 3);
       deepStrictEqual(log, [1, 2, 3]);
+    });
+    should('invalid concurrency limit', async () => {
+      throws(() => limit(0), { message: 'expected concurrencyLimit > 0, got 0' });
+      throws(() => limit(-1), { message: 'expected concurrencyLimit > 0, got -1' });
+      throws(() => mftch.ftch(fetch, { concurrencyLimit: 0 }), {
+        message: 'expected concurrencyLimit > 0, got 0',
+      });
+      throws(() => mftch.ftch(fetch, { concurrencyLimit: -1 }), {
+        message: 'expected concurrencyLimit > 0, got -1',
+      });
     });
   });
   if (REAL_NETWORK) {
@@ -310,6 +320,86 @@ describe('Network', () => {
     deepStrictEqual(await t(f1_t, { res: 7, sleep: 11 }, { timeout: 100 }), { res: 7 });
     deepStrictEqual(serverLog, [1, 2, 3, 4, 5, 6, 7]);
     serverLog.splice(0, serverLog.length);
+    // AbortSignal
+    const seen = [];
+    const pendingFetch = async (url, opts = {}) => {
+      seen.push({
+        url,
+        method: opts.method,
+        header: opts.headers.get('a'),
+      });
+      return new Promise((_, reject) => {
+        const signal = opts.signal;
+        if (!signal) return reject(new Error('missing signal'));
+        if (signal.aborted) return reject(signal.reason);
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    };
+    const caller = new AbortController();
+    const err = new Error('caller abort');
+    const fSignal = mftch.ftch(pendingFetch, { timeout: 30 });
+    const pSignal = fSignal('https://example.com', {
+      method: 'POST',
+      headers: { A: 'b' },
+      signal: caller.signal,
+    });
+    await sleep(0);
+    caller.abort(err);
+    await rejects(pSignal, { message: 'caller abort' });
+    await rejects(() =>
+      mftch.ftch(pendingFetch, { timeout: 1 })('https://timeout.example', {
+        signal: new AbortController().signal,
+      })
+    );
+    await rejects(() =>
+      mftch.ftch(pendingFetch)('https://timeout.example', {
+        signal: new AbortController().signal,
+        timeout: 1,
+      })
+    );
+    deepStrictEqual(seen, [
+      { url: 'https://example.com', method: 'POST', header: 'b' },
+      { url: 'https://timeout.example', method: undefined, header: null },
+      { url: 'https://timeout.example', method: undefined, header: null },
+    ]);
+    // URI userinfo auth
+    const authLog = [];
+    const authFetch = async (url, opts = {}) => {
+      authLog.push({
+        url,
+        auth: opts.headers.get('authorization'),
+        header: opts.headers.get('a'),
+      });
+      return {
+        headers: new Headers(),
+        ok: true,
+        redirected: false,
+        status: 200,
+        statusText: 'OK',
+        type: 'basic',
+        url,
+        json: async () => ({}),
+        text: async () => '',
+        arrayBuffer: async () => new TextEncoder().encode('{}').buffer,
+      };
+    };
+    const authNet = mftch.ftch(authFetch);
+    await authNet('https://user:pwd@example.com/path');
+    await authNet('https://:pwd@example.com/path');
+    await authNet('https://user:pa:ss@example.com/path');
+    const callerHeaders = new Headers({ A: 'b' });
+    await authNet('https://user:pwd@example.com/path', { headers: callerHeaders });
+    await authNet('https://user:pwd@example.com/path', {
+      headers: { Authorization: 'Bearer token' },
+    });
+    deepStrictEqual(authLog, [
+      { url: 'https://example.com/path', auth: 'Basic dXNlcjpwd2Q=', header: null },
+      { url: 'https://example.com/path', auth: 'Basic OnB3ZA==', header: null },
+      { url: 'https://example.com/path', auth: 'Basic dXNlcjpwYSUzQXNz', header: null },
+      { url: 'https://example.com/path', auth: 'Basic dXNlcjpwd2Q=', header: 'b' },
+      { url: 'https://example.com/path', auth: 'Bearer token', header: null },
+    ]);
+    deepStrictEqual(Array.from(callerHeaders.entries()), [['a', 'b']]);
     // Logs
     const log = [];
     const f1_l = mftch.ftch(fetch, {
@@ -477,6 +567,22 @@ describe('Network', () => {
       t1.map((i) => i.status),
       ['rejected', 'fulfilled', 'rejected', 'fulfilled', 'rejected']
     );
+    const transportError = new Error('fetch failed');
+    const rpcBatchTransportFailure = mftch.jsonrpc(
+      async () => {
+        throw transportError;
+      },
+      url,
+      { batchSize: 2 }
+    );
+    const t2 = await Promise.allSettled([
+      rpcBatchTransportFailure.call('tmp', 1),
+      rpcBatchTransportFailure.callNamed('tmp', { A: 1 }),
+    ]);
+    deepStrictEqual(t2, [
+      { status: 'rejected', reason: transportError },
+      { status: 'rejected', reason: transportError },
+    ]);
     await stop();
   });
   should('replayable', async () => {
@@ -544,6 +650,68 @@ describe('Network', () => {
       '{"url":"https://example.com","opt":{"headers":{}}}':
         '{"url":"https://example.com","method":"GET"}',
     });
+  });
+  should('replayable header key casing', async () => {
+    const fetchFn: mftch.FetchFn = async (url, opts = {}) => {
+      const headers = new Headers(opts.headers);
+      const body = JSON.stringify({ url, contentType: headers.get('content-type') });
+      return {
+        headers: new Headers(),
+        ok: true,
+        redirected: false,
+        status: 200,
+        statusText: 'OK',
+        type: 'basic',
+        url,
+        json: async () => JSON.parse(body),
+        text: async () => body,
+        arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+      };
+    };
+    const cases = [
+      { capture: new Headers({ 'Content-Type': 'x' }), replay: new Headers({ 'content-type': 'x' }) },
+      { capture: [['Content-Type', 'x']], replay: [['content-type', 'x']] },
+      { capture: { 'Content-Type': 'x' }, replay: { 'content-type': 'x' } },
+    ];
+    for (const { capture, replay } of cases) {
+      const live = mftch.replayable(fetchFn);
+      deepStrictEqual(await (await live('https://example.com', { headers: capture })).json(), {
+        url: 'https://example.com',
+        contentType: 'x',
+      });
+      const offline = mftch.replayable(fetchFn, live.logs, { offline: true });
+      deepStrictEqual(await (await offline('https://example.com', { headers: replay })).json(), {
+        url: 'https://example.com',
+        contentType: 'x',
+      });
+    }
+  });
+  should('replayable empty text body', async () => {
+    const fetchFn: mftch.FetchFn = async (url) => ({
+      headers: new Headers(),
+      ok: true,
+      redirected: false,
+      status: 204,
+      statusText: 'No Content',
+      type: 'basic',
+      url,
+      json: async () => {
+        throw new Error('no json');
+      },
+      text: async () => '',
+      arrayBuffer: async () => new Uint8Array().buffer,
+    });
+    const live = mftch.replayable(fetchFn);
+    const res = await live('https://example.com/empty');
+    deepStrictEqual(await res.text(), '');
+    const logs = live.export();
+    deepStrictEqual(
+      logs,
+      '{"{\\"url\\":\\"https://example.com/empty\\",\\"opt\\":{\\"headers\\":{}}}":""}'
+    );
+    const offline = mftch.replayable(fetchFn, JSON.parse(logs), { offline: true });
+    deepStrictEqual(await (await offline('https://example.com/empty')).text(), '');
+    await rejects(() => offline('https://example.com/missing'));
   });
 });
 

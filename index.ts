@@ -1,7 +1,7 @@
 /**
- * Wrappers for {@link https://developer.mozilla.org/en-US/docs/Web/API/fetch | built-in fetch()} enabling
- * killswitch, logging, concurrency limit, and other features. Fetch is great, but its usage in secure
- * environments is complicated. The library makes it simple.
+ * Wrappers for {@link https://developer.mozilla.org/en-US/docs/Web/API/fetch | built-in fetch()}
+ * enabling killswitch, logging, concurrency limit, and other features. Fetch is great, but its
+ * usage in secure environments is complicated. The library makes it simple.
  * @module
  * @example
  * Wrap fetch once, then compose JSON-RPC batching and replay support on top.
@@ -41,6 +41,9 @@
 const nextTick = async () => {};
 // Small internal primitive to limit concurrency
 function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  // Non-positive limits cannot start queued work and would leave callers pending.
+  if (concurrencyLimit <= 0)
+    throw new Error(`expected concurrencyLimit > 0, got ${concurrencyLimit}`);
   let currentlyProcessing = 0;
   const queue: ((value?: unknown) => void)[] = [];
   const next = () => {
@@ -185,6 +188,17 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
   const noNetwork = (url: string) => ks && !ks(url);
   const wrappedFetch: FetchFn = async (url, reqOpts = {}) => {
     const abort = new AbortController();
+    const callerSignal = reqOpts.signal;
+    let cleanupCallerSignal = () => {};
+    if (callerSignal) {
+      // Keep one internal signal for timeout and late killswitch aborts, while preserving caller aborts.
+      const abortCaller = () => abort.abort(callerSignal.reason);
+      if (callerSignal.aborted) abortCaller();
+      else {
+        callerSignal.addEventListener('abort', abortCaller, { once: true });
+        cleanupCallerSignal = () => callerSignal.removeEventListener('abort', abortCaller);
+      }
+    }
     let timeout = undefined;
     if (opts.timeout !== undefined || reqOpts.timeout !== undefined) {
       const ms = reqOpts.timeout !== undefined ? reqOpts.timeout : opts.timeout;
@@ -192,7 +206,8 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
     }
     const headers = new Headers(); // We cannot re-use object from user since we may modify it
     const parsed = new URL(url);
-    if (parsed.username) {
+    if (parsed.username || parsed.password) {
+      // RFC 7617 §2 builds `user-pass` as user-id ":" password; RFC 3986 §3.2.1 deprecates user:password in URI userinfo, so strip it after converting.
       const auth = btoa(`${parsed.username}:${parsed.password}`);
       headers.set('Authorization', `Basic ${auth}`);
       parsed.username = '';
@@ -205,27 +220,31 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
     }
     if (noNetwork(url)) throw new Error('network disabled');
     if (opts.log) opts.log(url, reqOpts);
-    const res = await fetchFunction(url, {
-      referrerPolicy: 'no-referrer', // avoid sending referrer by default
-      ...reqOpts,
-      headers,
-      signal: abort.signal,
-    });
-    if (noNetwork(url)) {
-      abort.abort('network disabled');
-      throw new Error('network disabled');
+    try {
+      const res = await fetchFunction(url, {
+        referrerPolicy: 'no-referrer', // avoid sending referrer by default
+        ...reqOpts,
+        headers,
+        signal: abort.signal,
+      });
+      if (noNetwork(url)) {
+        abort.abort('network disabled');
+        throw new Error('network disabled');
+      }
+      const body = new Uint8Array(await res.arrayBuffer());
+      return {
+        ...getRequestInfo(res),
+        // NOTE: this disables streaming parser and fetches whole body on request (instead of headers only as done in fetch)
+        // But this allows to intercept and disable request if killswitch enabled. Also required for concurrency limit,
+        // since actual request is not finished
+        json: async () => JSON.parse(new TextDecoder().decode(body)),
+        text: async () => new TextDecoder().decode(body),
+        arrayBuffer: async () => body.buffer,
+      };
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      cleanupCallerSignal();
     }
-    const body = new Uint8Array(await res.arrayBuffer());
-    if (timeout !== undefined) clearTimeout(timeout);
-    return {
-      ...getRequestInfo(res),
-      // NOTE: this disables streaming parser and fetches whole body on request (instead of headers only as done in fetch)
-      // But this allows to intercept and disable request if killswitch enabled. Also required for concurrency limit,
-      // since actual request is not finished
-      json: async () => JSON.parse(new TextDecoder().decode(body)),
-      text: async () => new TextDecoder().decode(body),
-      arrayBuffer: async () => body.buffer,
-    };
   };
   if (opts.concurrencyLimit !== undefined) {
     const curLimit = limit(opts.concurrencyLimit!);
@@ -333,14 +352,21 @@ export class JsonrpcProvider implements JsonrpcInterface {
     await nextTick(); // this allows to collect as much requests as we can in single tick
     const curr = this.queue.splice(0, this.batchSize);
     if (!curr.length) return;
-    const json = await this.fetchJson(
-      curr.map((i, j) => ({
-        jsonrpc: '2.0',
-        id: j,
-        method: i.method,
-        params: i.params,
-      }))
-    );
+    // Transport failures must reject every queued request; otherwise the batch leaks pending callers.
+    let json;
+    try {
+      json = await this.fetchJson(
+        curr.map((i, j) => ({
+          jsonrpc: '2.0',
+          id: j,
+          method: i.method,
+          params: i.params,
+        }))
+      );
+    } catch (err) {
+      curr.forEach((req) => req.reject(err));
+      return;
+    }
     if (!Array.isArray(json)) {
       const hasMsg = json.code && json.message;
       curr.forEach((req, index) => {
@@ -456,15 +482,12 @@ function normalizeHeader(header: string): string {
 }
 
 const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
-  let headers = opts.headers || {};
-  if (headers instanceof Headers) {
-    const tmp: Record<string, string> = {};
-    // Headers is lowercase
-    headers.forEach((v, k) => {
-      tmp[normalizeHeader(k)] = v;
-    });
-    headers = tmp;
-  }
+  // RFC 9110 §5.1: field names are case-insensitive, so replay keys need canonicalized header names.
+  const headers: Record<string, string> = {};
+  // Headers accepts every HeadersInit shape and normalizes duplicate handling like fetch.
+  new Headers(opts.headers).forEach((v, k) => {
+    headers[normalizeHeader(k)] = v;
+  });
   return fn(url, { method: opts.method, headers, body: opts.body });
 };
 
@@ -529,7 +552,8 @@ export function replayable(
   const wrapped = async (url: string, reqOpts: FetchOpts = {}) => {
     const key = getKey(url, reqOpts, opts.getKey);
     accessed.add(key);
-    if (!logs[key]) {
+    // Empty-string payloads are valid captures; missing entries must be checked by key presence, not truthiness.
+    if (!(key in logs)) {
       if (opts.offline) throw new Error(`fetchReplay: unknown request=${key}`);
       const req = await fetchFunction(url, reqOpts);
       // TODO: save this too?
@@ -543,6 +567,7 @@ export function replayable(
         },
         text: async () => (logs[key] = await req.text()),
         arrayBuffer: async () => {
+          // TODO: add opt-in binary-safe replay; default logs stay readable text for existing fixtures.
           const buffer = await req.arrayBuffer();
           logs[key] = new TextDecoder().decode(new Uint8Array(buffer));
           return buffer;
@@ -573,6 +598,6 @@ export function replayable(
 /** Internal methods for test purposes only. */
 export const _TEST: {
   limit: typeof limit;
-} = {
+} = /* @__PURE__ */ Object.freeze({
   limit,
-};
+});
