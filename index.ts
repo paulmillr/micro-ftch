@@ -39,6 +39,20 @@
 // Utils
 // Awaiting for promise is equal to node nextTick
 const nextTick = async () => {};
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+// btoa/atob are Latin-1 only: convert through raw bytes, chunked to avoid arg-spread limits.
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000)
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
 // Small internal primitive to limit concurrency
 function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T> {
   // Non-positive limits cannot start queued work and would leave callers pending.
@@ -69,6 +83,19 @@ function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T
       next();
     });
 }
+// Small internal primitive to space out starts: at most `rps` calls begin per second.
+function rateLimit(rps: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  if (!Number.isFinite(rps) || rps <= 0) throw new Error(`expected rps > 0, got ${rps}`);
+  const interval = 1000 / rps;
+  let nextStart = 0;
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    const now = Date.now();
+    const start = Math.max(nextStart, now);
+    nextStart = start + interval;
+    if (start > now) await sleep(start - now);
+    return fn();
+  };
+}
 
 /** Arguments for built-in fetch, with added timeout support. */
 export type FetchOpts = RequestInit & {
@@ -94,6 +121,11 @@ export type FetchFn = (
   json: () => Promise<any>;
   text: () => Promise<string>;
   arrayBuffer: () => Promise<ArrayBuffer>;
+  /**
+   * Optional raw body stream (present on real fetch Responses).
+   * When available, `ftch` uses it to enforce `maxBodySize` without buffering first.
+   */
+  body?: ReadableStream<Uint8Array> | null;
 }>;
 
 /** Options for `ftch`. */
@@ -110,8 +142,22 @@ export type FtchOpts = {
    * @returns `true` when the request should be allowed.
    */
   killswitch?: (url?: string) => boolean;
+  /**
+   * Only allow requests to these hosts. Entries match `URL.hostname` (`example.com`) or
+   * `URL.host` (`example.com:8443`), case-insensitive. Checked before `isValidRequest`,
+   * re-checked on the final (post-redirect) URL, and rejects relative URLs whose host
+   * cannot be verified.
+   */
+  allowedHosts?: string[];
   /** Maximum number of wrapped requests allowed to run at once. */
   concurrencyLimit?: number;
+  /** Maximum request starts per second. */
+  rps?: number;
+  /**
+   * Maximum response body size in bytes; oversized responses are aborted.
+   * Default: 1 GiB. Pass `Infinity` to disable.
+   */
+  maxBodySize?: number;
   /** Default timeout in milliseconds for wrapped requests. */
   timeout?: number;
   /**
@@ -125,6 +171,48 @@ export type FtchOpts = {
 type UnPromise<T> = T extends Promise<infer U> ? U : T;
 // NOTE: we don't expose actual request to make sure there is no way to trigger actual network code
 // from wrapped function
+// ftch buffers whole bodies by design (see NOTE in ftch), which makes an unbounded response an
+// OOM vector: enforce the cap while reading. Content-Length is a fast reject for honest servers;
+// streaming catches liars; the arrayBuffer fallback (non-stream FetchFns) can only check after the fact.
+async function readBodyLimited(
+  req: UnPromise<ReturnType<FetchFn>>,
+  maxBodySize: number,
+  abort: AbortController
+): Promise<Uint8Array<ArrayBuffer>> {
+  const tooBig = () => {
+    abort.abort('maxBodySize exceeded');
+    return new Error(`response body exceeds maxBodySize=${maxBodySize}`);
+  };
+  const len = req.headers.get('content-length');
+  if (len !== null && Number(len) > maxBodySize) throw tooBig();
+  const stream = req.body;
+  if (stream != null && typeof stream.getReader === 'function') {
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxBodySize) {
+        reader.cancel().catch(() => {});
+        throw tooBig();
+      }
+      chunks.push(value);
+    }
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return body;
+  }
+  const body = new Uint8Array(await req.arrayBuffer());
+  if (body.length > maxBodySize) throw tooBig();
+  return body;
+}
+
 const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
   headers: req.headers,
   ok: req.ok,
@@ -186,6 +274,24 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
   const ks = opts.isValidRequest || opts.killswitch;
   if (ks && typeof ks !== 'function') throw new Error('opts.isValidRequest must be a function');
   const noNetwork = (url: string) => ks && !ks(url);
+  if (
+    opts.allowedHosts !== undefined &&
+    (!Array.isArray(opts.allowedHosts) || opts.allowedHosts.some((h) => typeof h !== 'string'))
+  )
+    throw new Error('opts.allowedHosts must be an array of strings');
+  const hosts =
+    opts.allowedHosts === undefined ? undefined : opts.allowedHosts.map((h) => h.toLowerCase());
+  const hostOk = (parsed: URL) =>
+    hosts === undefined || hosts.includes(parsed.hostname) || hosts.includes(parsed.host);
+  // Checked before isValidRequest: the declarative allowlist must not be bypassable by hook logic.
+  const checkHost = (parsed: URL | undefined, url: string) => {
+    if (hosts === undefined) return;
+    if (parsed === undefined)
+      throw new Error('allowedHosts: cannot verify host of relative URL: ' + url);
+    if (!hostOk(parsed)) throw new Error('allowedHosts: host not allowed: ' + parsed.host);
+  };
+  const maxBodySize = opts.maxBodySize === undefined ? 1024 ** 3 : opts.maxBodySize;
+  if (!(maxBodySize > 0)) throw new Error(`expected maxBodySize > 0, got ${maxBodySize}`);
   const wrappedFetch: FetchFn = async (url, reqOpts = {}) => {
     const abort = new AbortController();
     const callerSignal = reqOpts.signal;
@@ -205,10 +311,18 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       timeout = setTimeout(() => abort.abort(), ms);
     }
     const headers = new Headers(); // We cannot re-use object from user since we may modify it
-    const parsed = new URL(url);
-    if (parsed.username || parsed.password) {
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(url);
+    } catch {
+      // Relative URL: fetch resolves it against the document base; there is no userinfo to extract.
+    }
+    if (parsed && (parsed.username || parsed.password)) {
       // RFC 7617 §2 builds `user-pass` as user-id ":" password; RFC 3986 §3.2.1 deprecates user:password in URI userinfo, so strip it after converting.
-      const auth = btoa(`${parsed.username}:${parsed.password}`);
+      // URL exposes userinfo percent-encoded, and credentials may be non-Latin-1: decode, then base64 the UTF-8 bytes.
+      const user = decodeURIComponent(parsed.username);
+      const pass = decodeURIComponent(parsed.password);
+      const auth = bytesToBase64(new TextEncoder().encode(`${user}:${pass}`));
       headers.set('Authorization', `Basic ${auth}`);
       parsed.username = '';
       parsed.password = '';
@@ -218,6 +332,7 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       const h = reqOpts.headers instanceof Headers ? reqOpts.headers : new Headers(reqOpts.headers);
       h.forEach((v, k) => headers.set(k, v));
     }
+    checkHost(parsed, url);
     if (noNetwork(url)) throw new Error('network disabled');
     if (opts.log) opts.log(url, reqOpts);
     try {
@@ -231,7 +346,18 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
         abort.abort('network disabled');
         throw new Error('network disabled');
       }
-      const body = new Uint8Array(await res.arrayBuffer());
+      if (hosts !== undefined && res.url) {
+        // Redirects can land on a different host; re-verify the final URL before reading the body.
+        let finalUrl: URL | undefined;
+        try {
+          finalUrl = new URL(res.url);
+        } catch {}
+        if (finalUrl !== undefined && !hostOk(finalUrl)) {
+          abort.abort('redirect to disallowed host');
+          throw new Error('allowedHosts: host not allowed: ' + finalUrl.host);
+        }
+      }
+      const body = await readBodyLimited(res, maxBodySize, abort);
       return {
         ...getRequestInfo(res),
         // NOTE: this disables streaming parser and fetches whole body on request (instead of headers only as done in fetch)
@@ -246,11 +372,19 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       cleanupCallerSignal();
     }
   };
-  if (opts.concurrencyLimit !== undefined) {
-    const curLimit = limit(opts.concurrencyLimit!);
-    return (url, reqOpts) => curLimit(() => wrappedFetch(url, reqOpts));
+  // rps sits closest to the network so actual request starts stay spaced; concurrencyLimit wraps it.
+  let out: FetchFn = wrappedFetch;
+  if (opts.rps !== undefined) {
+    const rate = rateLimit(opts.rps);
+    const inner = out;
+    out = (url, reqOpts) => rate(() => inner(url, reqOpts));
   }
-  return wrappedFetch;
+  if (opts.concurrencyLimit !== undefined) {
+    const curLimit = limit(opts.concurrencyLimit);
+    const inner = out;
+    out = (url, reqOpts) => curLimit(() => inner(url, reqOpts));
+  }
+  return out;
 }
 
 // Jsonrpc
@@ -299,7 +433,7 @@ type RpcErrorResponse = { code: number; message: string };
 export class RpcError extends Error {
   readonly code: number;
   constructor(error: RpcErrorResponse) {
-    super(`FetchProvider(${error.code}): ${error.message || error}`);
+    super(`FetchProvider(${error.code}): ${error.message || JSON.stringify(error)}`);
     this.code = error.code;
     this.name = 'RpcError';
   }
@@ -368,7 +502,10 @@ export class JsonrpcProvider implements JsonrpcInterface {
       return;
     }
     if (!Array.isArray(json)) {
-      const hasMsg = json.code && json.message;
+      // Guard property access: `null` and primitives are valid JSON, and throwing here would
+      // leave every queued promise pending (batchProcess runs unawaited).
+      const hasMsg =
+        json != null && typeof json === 'object' && json.code != null && json.message != null;
       curr.forEach((req, index) => {
         const err = hasMsg
           ? this.jsonError(json)
@@ -379,13 +516,14 @@ export class JsonrpcProvider implements JsonrpcInterface {
     }
     const processed = new Set();
     for (const res of json) {
-      // Server sent broken ids. We cannot throw error here, since we will have unresolved promises
-      // Also, this will break app state.
+      // Server sent broken ids or entries. We cannot throw error here, since we will have
+      // unresolved promises. Also, this will break app state.
+      if (res == null || typeof res !== 'object') continue;
       if (!Number.isSafeInteger(res.id) || res.id < 0 || res.id >= curr.length) continue;
       if (processed.has(res.id)) continue; // multiple responses for same id
       const { reject, resolve } = curr[res.id];
       processed.add(res.id);
-      if (res && res.error) reject(this.jsonError(res.error));
+      if (res.error) reject(this.jsonError(res.error));
       else resolve(res.result);
     }
     for (let i = 0; i < curr.length; i++) {
@@ -407,7 +545,9 @@ export class JsonrpcProvider implements JsonrpcInterface {
       method,
       params,
     });
-    if (json && json.error) throw this.jsonError(json.error);
+    if (json == null || typeof json !== 'object')
+      throw new Error('invalid rpc response: ' + JSON.stringify(json));
+    if (json.error) throw this.jsonError(json.error);
     return json.result;
   }
   call(method: string, ...args: any[]): Promise<any> {
@@ -453,6 +593,36 @@ export function jsonrpc(
 type GetKeyFn = (url: string, opt: FetchOpts) => string;
 const defaultGetKey: GetKeyFn = (url, opt) => JSON.stringify({ url, opt });
 
+/**
+ * Structured replay log entry: response metadata captured alongside the body.
+ * Plain-string entries (body only, pre-1.1 format) are still accepted and replay
+ * with default 200/OK metadata.
+ */
+export type ReplayLogEntry = {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  /** Body text, or base64 behind the binary marker (same encoding as legacy entries). */
+  body: string;
+};
+
+// Used for offline-mode misses: keys are long JSON blobs, so point at the most similar
+// existing key (longest common prefix) to make fixture mismatches debuggable.
+function closestKey(key: string, keys: string[]): string | undefined {
+  let best: string | undefined;
+  let bestLen = -1;
+  for (const k of keys) {
+    const max = Math.min(k.length, key.length);
+    let i = 0;
+    while (i < max && k[i] === key[i]) i++;
+    if (i > bestLen) {
+      bestLen = i;
+      best = k;
+    }
+  }
+  return best;
+}
+
 /** Options for replayable(). */
 export type ReplayOpts = {
   /** Throw instead of using the wrapped fetch when a request is missing from the log. */
@@ -479,6 +649,22 @@ function normalizeHeader(header: string): string {
     .split('-')
     .map((i) => i.charAt(0).toUpperCase() + i.slice(1).toLowerCase())
     .join('-');
+}
+
+// Captured bodies are stored as strings so exported logs stay readable. Binary payloads that
+// don't survive a UTF-8 round-trip are stored base64-encoded behind this marker instead of
+// being silently corrupted. Existing plain-text fixtures keep working unchanged.
+const B64_MARK = ' b64 ';
+function encodeBody(bytes: Uint8Array): string {
+  const text = new TextDecoder().decode(bytes);
+  const reencoded = new TextEncoder().encode(text);
+  const lossless = reencoded.length === bytes.length && reencoded.every((b, i) => b === bytes[i]);
+  if (lossless && !text.startsWith(B64_MARK)) return text;
+  return B64_MARK + bytesToBase64(bytes);
+}
+function decodeBody(stored: string): Uint8Array<ArrayBuffer> {
+  if (stored.startsWith(B64_MARK)) return base64ToBytes(stored.slice(B64_MARK.length));
+  return new TextEncoder().encode(stored);
 }
 
 const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
@@ -545,7 +731,7 @@ const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
  */
 export function replayable(
   fetchFunction: FetchFn,
-  logs: Record<string, string> = {},
+  logs: Record<string, string | ReplayLogEntry> = {},
   opts: ReplayOpts = {}
 ): ReplayFn {
   const accessed: Set<string> = new Set();
@@ -554,38 +740,57 @@ export function replayable(
     accessed.add(key);
     // Empty-string payloads are valid captures; missing entries must be checked by key presence, not truthiness.
     if (!(key in logs)) {
-      if (opts.offline) throw new Error(`fetchReplay: unknown request=${key}`);
+      if (opts.offline) {
+        const closest = closestKey(key, Object.keys(logs));
+        throw new Error(
+          `fetchReplay: unknown request=${key}` +
+            (closest === undefined ? '' : `, closest logged request=${closest}`)
+        );
+      }
       const req = await fetchFunction(url, reqOpts);
       // TODO: save this too?
       const info = getRequestInfo(req);
+      // Read the underlying body once and reuse it: raw fetch responses throw on a second read,
+      // and callers may invoke several body methods on the same wrapped response.
+      let bodyPromise: Promise<Uint8Array<ArrayBuffer>> | undefined;
+      const readBody = () => {
+        if (bodyPromise === undefined)
+          bodyPromise = req.arrayBuffer().then((buffer) => {
+            const bytes = new Uint8Array(buffer);
+            const headers: Record<string, string> = {};
+            info.headers.forEach((v, k) => (headers[k] = v));
+            logs[key] = {
+              status: info.status,
+              statusText: info.statusText,
+              headers,
+              body: encodeBody(bytes),
+            };
+            return bytes;
+          });
+        return bodyPromise;
+      };
       return {
         ...info,
-        json: async () => {
-          const json = await req.json();
-          logs[key] = JSON.stringify(json);
-          return json;
-        },
-        text: async () => (logs[key] = await req.text()),
-        arrayBuffer: async () => {
-          // TODO: add opt-in binary-safe replay; default logs stay readable text for existing fixtures.
-          const buffer = await req.arrayBuffer();
-          logs[key] = new TextDecoder().decode(new Uint8Array(buffer));
-          return buffer;
-        },
+        json: async () => JSON.parse(new TextDecoder().decode(await readBody())),
+        text: async () => new TextDecoder().decode(await readBody()),
+        arrayBuffer: async () => (await readBody()).buffer,
       };
     }
+    const entry = logs[key];
+    const isLegacy = typeof entry === 'string'; // body-only entry: replay with default metadata
+    const body = isLegacy ? entry : entry.body;
+    const status = isLegacy ? 200 : entry.status;
     return {
-      // Some default values (we don't store this info for now)
-      headers: new Headers(),
-      ok: true,
+      headers: new Headers(isLegacy ? undefined : entry.headers),
+      ok: status >= 200 && status < 300,
       redirected: false,
-      status: 200,
-      statusText: 'OK',
+      status,
+      statusText: isLegacy ? 'OK' : entry.statusText,
       type: 'basic' as ResponseType,
       url: url,
-      text: async () => logs[key],
-      json: async () => JSON.parse(logs[key]),
-      arrayBuffer: async () => new TextEncoder().encode(logs[key]).buffer,
+      text: async () => new TextDecoder().decode(decodeBody(body)),
+      json: async () => JSON.parse(new TextDecoder().decode(decodeBody(body))),
+      arrayBuffer: async () => decodeBody(body).buffer,
     };
   };
   wrapped.logs = logs;
@@ -595,9 +800,126 @@ export function replayable(
   return wrapped;
 }
 
+// Retry
+/** Context passed to `RetryOpts.shouldRetry` after a failed attempt. */
+export type RetryContext = {
+  /** Request URL. */
+  url: string;
+  /** Options of the request being retried. */
+  opts: FetchOpts;
+  /** 0-based index of the attempt that just failed. */
+  attempt: number;
+  /** Error thrown by the wrapped fetch, when it rejected (network error, timeout, abort). */
+  error?: unknown;
+  /** HTTP status, when a (non-ok) response was received. */
+  status?: number;
+};
+
+/** Options for retry(). */
+export type RetryOpts = {
+  /** Total number of attempts, including the first one. Default: 3. */
+  attempts?: number;
+  /** Base backoff delay in ms; grows exponentially per attempt, with full jitter. Default: 100. */
+  baseDelay?: number;
+  /** Upper bound in ms for backoff and Retry-After waits. Default: 5000. */
+  maxDelay?: number;
+  /**
+   * Decides whether a failed attempt should be retried.
+   * Default policy only retries safe methods (GET/HEAD/OPTIONS) — retrying a POST can duplicate
+   * a non-idempotent action — and only on thrown errors or status 408/429/5xx.
+   * Pass a custom predicate to retry POST (e.g. JSON-RPC) explicitly.
+   */
+  shouldRetry?: (ctx: RetryContext) => boolean;
+};
+
+const defaultShouldRetry = (ctx: RetryContext): boolean => {
+  const method = (ctx.opts.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') return false;
+  if (ctx.status === undefined) return true; // thrown error: network failure, timeout
+  return ctx.status === 408 || ctx.status === 429 || ctx.status >= 500;
+};
+
+// RFC 9110 §10.2.3: Retry-After is either delay-seconds or an HTTP-date.
+function parseRetryAfter(headers: Headers): number | undefined {
+  const value = headers.get('retry-after');
+  if (value === null) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return undefined;
+}
+
+/**
+ * Retries failed requests with exponential backoff and full jitter.
+ * Composable with the other wrappers: stack it over `ftch`, under `jsonrpc`.
+ * Non-ok responses that exhaust attempts (or are not retriable) are returned, not thrown,
+ * preserving fetch semantics. Honors the server's Retry-After header, capped by `maxDelay`.
+ * @param fetchFunction - Fetch implementation to wrap.
+ * @param opts - Retry configuration. See {@link RetryOpts}.
+ * @returns Wrapped fetch function that retries failed attempts.
+ * @example
+ * Retry flaky GET endpoints with default policy (3 attempts, 408/429/5xx or network errors).
+ * ```js
+ * import { ftch, retry } from 'micro-ftch';
+ * const net = retry(ftch(fetch), { attempts: 3, baseDelay: 100 });
+ * await net('https://example.com');
+ * ```
+ * @example
+ * JSON-RPC uses POST, which the default policy does not retry; opt in explicitly.
+ * ```js
+ * import { ftch, jsonrpc, retry } from 'micro-ftch';
+ * const net = retry(ftch(fetch), {
+ *   shouldRetry: (ctx) => ctx.error !== undefined || ctx.status === 429 || ctx.status >= 500,
+ * });
+ * const rpc = jsonrpc(net, 'http://rpc_node/', { batchSize: 20 });
+ * ```
+ */
+export function retry(fetchFunction: FetchFn, opts: RetryOpts = {}): FetchFn {
+  const attempts = opts.attempts === undefined ? 3 : opts.attempts;
+  if (!Number.isSafeInteger(attempts) || attempts < 1)
+    throw new Error(`expected attempts >= 1, got ${attempts}`);
+  const baseDelay = opts.baseDelay === undefined ? 100 : opts.baseDelay;
+  const maxDelay = opts.maxDelay === undefined ? 5000 : opts.maxDelay;
+  const shouldRetry = opts.shouldRetry || defaultShouldRetry;
+  if (typeof shouldRetry !== 'function') throw new Error('opts.shouldRetry must be a function');
+  return async (url, reqOpts = {}) => {
+    for (let attempt = 0; ; attempt++) {
+      let res;
+      let error: unknown;
+      let failed = false;
+      try {
+        res = await fetchFunction(url, reqOpts);
+      } catch (e) {
+        error = e;
+        failed = true;
+      }
+      const success = !failed && res !== undefined && res.ok;
+      const isLast = attempt >= attempts - 1;
+      const aborted =
+        reqOpts.signal !== undefined && reqOpts.signal !== null && reqOpts.signal.aborted;
+      if (
+        success ||
+        isLast ||
+        aborted ||
+        !shouldRetry({ url, opts: reqOpts, attempt, error, status: res && res.status })
+      ) {
+        if (failed) throw error;
+        return res!;
+      }
+      // Retry-After takes priority over computed backoff; both are capped by maxDelay.
+      const retryAfter = res === undefined ? undefined : parseRetryAfter(res.headers);
+      const backoff = Math.random() * Math.min(maxDelay, baseDelay * 2 ** attempt);
+      await sleep(retryAfter === undefined ? backoff : Math.min(retryAfter, maxDelay));
+    }
+  };
+}
+
 /** Internal methods for test purposes only. */
 export const _TEST: {
   limit: typeof limit;
+  rateLimit: typeof rateLimit;
 } = /* @__PURE__ */ Object.freeze({
   limit,
+  rateLimit,
 });
