@@ -743,4 +743,3 @@ export const _TEST = /* @__PURE__ */ Object.freeze({
     limit,
     rateLimit,
 });
-//# sourceMappingURL=index.js.map
