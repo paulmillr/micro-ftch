@@ -1,8 +1,10 @@
 name: Run tests
 on:
-  - push
-  - pull_request
+  push:
+    branches:
+      - main
+  pull_request:
 jobs:
   test-ts:
-    name: jsbt v0.6.0
-    uses: paulmillr/jsbt/.github/workflows/test.yml@7c25cb0b5eadac32bfedbb3b60ca0bd4289791f1
+    name: jsbt v0.6.2
+    uses: paulmillr/jsbt/.github/workflows/test.yml@e7792651088ad10a04fd63f76760a3465cc5c076
