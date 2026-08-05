@@ -387,6 +387,8 @@ describe('Network', () => {
     await authNet('https://user:pwd@example.com/path');
     await authNet('https://:pwd@example.com/path');
     await authNet('https://user:pa:ss@example.com/path');
+    await authNet('https://us%40er:p%40ss@example.com/path');
+    await authNet('https://user:p%D0%B0ss@example.com/path'); // non-Latin-1 password (cyrillic а)
     const callerHeaders = new Headers({ A: 'b' });
     await authNet('https://user:pwd@example.com/path', { headers: callerHeaders });
     await authNet('https://user:pwd@example.com/path', {
@@ -395,7 +397,12 @@ describe('Network', () => {
     deepStrictEqual(authLog, [
       { url: 'https://example.com/path', auth: 'Basic dXNlcjpwd2Q=', header: null },
       { url: 'https://example.com/path', auth: 'Basic OnB3ZA==', header: null },
-      { url: 'https://example.com/path', auth: 'Basic dXNlcjpwYSUzQXNz', header: null },
+      // userinfo is percent-decoded before encoding (RFC 7617 §2): 'user:pa:ss'
+      { url: 'https://example.com/path', auth: 'Basic dXNlcjpwYTpzcw==', header: null },
+      // 'us@er:p@ss'
+      { url: 'https://example.com/path', auth: 'Basic dXNAZXI6cEBzcw==', header: null },
+      // UTF-8 bytes of 'user:pаss' survive base64 (btoa alone would throw)
+      { url: 'https://example.com/path', auth: 'Basic dXNlcjpw0LBzcw==', header: null },
       { url: 'https://example.com/path', auth: 'Basic dXNlcjpwd2Q=', header: 'b' },
       { url: 'https://example.com/path', auth: 'Bearer token', header: null },
     ]);
@@ -607,10 +614,18 @@ describe('Network', () => {
     deepStrictEqual(await t(replayCapture, { res: 2 }), { res: 2 });
     deepStrictEqual(serverLog, [1, 2]);
     const logs = replayCapture.export();
-    deepStrictEqual(
-      logs,
-      '{"{\\"url\\":\\"http://127.0.0.1:8003/\\",\\"opt\\":{\\"method\\":\\"POST\\",\\"headers\\":{\\"Content-Type\\":\\"application/json\\"},\\"body\\":\\"{\\\\\\"res\\\\\\":1}\\"}}":"{\\"res\\":1}","{\\"url\\":\\"http://127.0.0.1:8003/\\",\\"opt\\":{\\"method\\":\\"POST\\",\\"headers\\":{\\"Content-Type\\":\\"application/json\\"},\\"body\\":\\"{\\\\\\"res\\\\\\":2}\\"}}":"{\\"res\\":2}"}'
-    );
+    const parsedLogs = JSON.parse(logs);
+    const logKeys = Object.keys(parsedLogs);
+    deepStrictEqual(logKeys, [
+      '{"url":"http://127.0.0.1:8003/","opt":{"method":"POST","headers":{"Content-Type":"application/json"},"body":"{\\"res\\":1}"}}',
+      '{"url":"http://127.0.0.1:8003/","opt":{"method":"POST","headers":{"Content-Type":"application/json"},"body":"{\\"res\\":2}"}}',
+    ]);
+    // Entries capture response metadata alongside the body; live server headers (date etc.) vary,
+    // so check the stable fields only.
+    deepStrictEqual(parsedLogs[logKeys[0]].body, '{"res":1}');
+    deepStrictEqual(parsedLogs[logKeys[1]].body, '{"res":2}');
+    deepStrictEqual(parsedLogs[logKeys[0]].status, 200);
+    deepStrictEqual(parsedLogs[logKeys[0]].headers['content-type'], 'application/json');
     const replayTest = mftch.replayable(ftch, JSON.parse(logs));
     deepStrictEqual(await t(replayTest, { res: 1 }), { res: 1 });
     deepStrictEqual(await t(replayTest, { res: 2 }), { res: 2 });
@@ -647,8 +662,12 @@ describe('Network', () => {
       method: 'GET',
     });
     deepStrictEqual(replay.logs, {
-      '{"url":"https://example.com","opt":{"headers":{}}}':
-        '{"url":"https://example.com","method":"GET"}',
+      '{"url":"https://example.com","opt":{"headers":{}}}': {
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        body: '{"url":"https://example.com","method":"GET"}',
+      },
     });
   });
   should('replayable header key casing', async () => {
@@ -705,13 +724,218 @@ describe('Network', () => {
     const res = await live('https://example.com/empty');
     deepStrictEqual(await res.text(), '');
     const logs = live.export();
-    deepStrictEqual(
-      logs,
-      '{"{\\"url\\":\\"https://example.com/empty\\",\\"opt\\":{\\"headers\\":{}}}":""}'
-    );
+    deepStrictEqual(JSON.parse(logs), {
+      '{"url":"https://example.com/empty","opt":{"headers":{}}}': {
+        status: 204,
+        statusText: 'No Content',
+        headers: {},
+        body: '',
+      },
+    });
     const offline = mftch.replayable(fetchFn, JSON.parse(logs), { offline: true });
     deepStrictEqual(await (await offline('https://example.com/empty')).text(), '');
     await rejects(() => offline('https://example.com/missing'));
+  });
+});
+
+describe('Wrappers v1.1', () => {
+  const fakeRes = (opts: any = {}) => {
+    const status = opts.status || 200;
+    const body = opts.body || '';
+    return {
+      headers: new Headers(opts.headers || {}),
+      ok: status >= 200 && status < 300,
+      redirected: false,
+      status,
+      statusText: opts.statusText || 'OK',
+      type: 'basic' as ResponseType,
+      url: opts.url || '',
+      json: async () => JSON.parse(body),
+      text: async () => body,
+      arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+    };
+  };
+  should('allowedHosts', async () => {
+    const calls = [];
+    const fetchFn = async (url) => {
+      calls.push(url);
+      return fakeRes({ url, body: 'ok' });
+    };
+    // Rejected before isValidRequest runs: allowlist takes precedence over the hook
+    const f = mftch.ftch(fetchFn, {
+      allowedHosts: ['example.com'],
+      isValidRequest: () => {
+        throw new Error('isValidRequest must not run for disallowed hosts');
+      },
+    });
+    await rejects(() => f('https://evil.com/'), /host not allowed/);
+    deepStrictEqual(calls, []);
+    let ksCalls = 0;
+    const f2 = mftch.ftch(fetchFn, {
+      allowedHosts: ['Example.com', 'localhost:8080'],
+      isValidRequest: () => {
+        ksCalls++;
+        return true;
+      },
+    });
+    await f2('https://example.com/x'); // hostname entry, case-insensitive
+    deepStrictEqual(ksCalls, 2); // killswitch runs before and after the fetch
+    await f2('http://localhost:8080/'); // host:port entry
+    await rejects(() => f2('http://localhost:9999/'), /host not allowed/);
+    await rejects(() => f2('/relative'), /relative URL/);
+    // Redirect landing on a different host is rejected after the fetch
+    const fRedir = mftch.ftch(async (url) => fakeRes({ url: 'https://evil.com/landed', body: 'x' }), {
+      allowedHosts: ['example.com'],
+    });
+    await rejects(() => fRedir('https://example.com/'), /host not allowed/);
+    throws(() => mftch.ftch(fetchFn, { allowedHosts: 'example.com' as any }));
+  });
+  should('maxBodySize', async () => {
+    const body = 'a'.repeat(100);
+    const mkFetch = (headers) => async (url) => fakeRes({ url, body, headers });
+    // Content-Length fast reject
+    await rejects(
+      () => mftch.ftch(mkFetch({ 'content-length': '100' }), { maxBodySize: 10 })('https://x.com/'),
+      /maxBodySize/
+    );
+    // Fallback (no stream): actual length checked after reading
+    await rejects(() => mftch.ftch(mkFetch({}), { maxBodySize: 10 })('https://x.com/'), /maxBodySize/);
+    deepStrictEqual(
+      await (await mftch.ftch(mkFetch({}), { maxBodySize: 100 })('https://x.com/')).text(),
+      body
+    );
+    // Streaming path: aborts mid-body without buffering the rest
+    const streamRes = (chunks) => ({
+      ...fakeRes({}),
+      body: new ReadableStream({
+        start(c) {
+          for (const chunk of chunks) c.enqueue(new TextEncoder().encode(chunk));
+          c.close();
+        },
+      }),
+    });
+    await rejects(
+      () =>
+        mftch.ftch(async () => streamRes(['aaaa', 'bbbb', 'cccc']), { maxBodySize: 10 })('https://x.com/'),
+      /maxBodySize/
+    );
+    const ok = await mftch.ftch(async () => streamRes(['aaaa', 'bbbb']), { maxBodySize: 10 })('https://x.com/');
+    deepStrictEqual(await ok.text(), 'aaaabbbb');
+    throws(() => mftch.ftch(mkFetch({}), { maxBodySize: 0 }));
+  });
+  should('rps', async () => {
+    const starts = [];
+    const f = mftch.ftch(
+      async (url) => {
+        starts.push(Date.now());
+        return fakeRes({ url, body: 'x' });
+      },
+      { rps: 20 } // 50ms spacing
+    );
+    await Promise.all([f('https://x.com/1'), f('https://x.com/2'), f('https://x.com/3')]);
+    deepStrictEqual(starts.length, 3);
+    // timers may fire marginally early; assert spacing with tolerance
+    for (const gap of [starts[1] - starts[0], starts[2] - starts[1]])
+      deepStrictEqual(gap >= 40, true, `expected gap >= 40ms, got ${gap}`);
+    throws(() => mftch.ftch(async (url) => fakeRes({ url }), { rps: 0 }));
+  });
+  should('replayable response metadata', async () => {
+    const fetchFn = async (url) =>
+      fakeRes({ url, status: 404, statusText: 'Not Found', headers: { 'x-a': '1' }, body: 'missing' });
+    const live = mftch.replayable(fetchFn);
+    const r1 = await live('https://example.com/404');
+    deepStrictEqual([r1.status, r1.ok], [404, false]);
+    await r1.text();
+    const offline = mftch.replayable(
+      async () => {
+        throw new Error('no network');
+      },
+      JSON.parse(live.export()),
+      { offline: true }
+    );
+    const r2 = await offline('https://example.com/404');
+    deepStrictEqual(
+      [r2.status, r2.statusText, r2.ok, r2.headers.get('x-a')],
+      [404, 'Not Found', false, '1']
+    );
+    deepStrictEqual(await r2.text(), 'missing');
+    // Misses in offline mode point at the most similar logged key
+    await rejects(() => offline('https://example.com/405'), /closest logged request/);
+  });
+  should('retry', async () => {
+    // network errors retried, succeeds on 3rd attempt
+    let n = 0;
+    const flaky = async (url) => {
+      if (++n < 3) throw new Error('conn reset');
+      return fakeRes({ url, body: 'ok' });
+    };
+    deepStrictEqual(
+      await (await mftch.retry(flaky, { baseDelay: 1, maxDelay: 5 })('https://x.com/')).text(),
+      'ok'
+    );
+    deepStrictEqual(n, 3);
+    // exhausted attempts rethrow the last error
+    n = 0;
+    await rejects(
+      () =>
+        mftch.retry(
+          async () => {
+            n++;
+            throw new Error('conn reset');
+          },
+          { attempts: 2, baseDelay: 1 }
+        )('https://x.com/'),
+      /conn reset/
+    );
+    deepStrictEqual(n, 2);
+    // 5xx retried for GET; last non-ok response is returned, not thrown
+    n = 0;
+    const f500 = mftch.retry(
+      async (url) => {
+        n++;
+        return fakeRes({ url, status: 500, statusText: 'ISE', body: 'e' });
+      },
+      { attempts: 2, baseDelay: 1 }
+    );
+    deepStrictEqual((await f500('https://x.com/')).status, 500);
+    deepStrictEqual(n, 2);
+    // POST not retried by default policy
+    n = 0;
+    await rejects(() =>
+      mftch.retry(
+        async () => {
+          n++;
+          throw new Error('x');
+        },
+        { attempts: 3, baseDelay: 1 }
+      )('https://x.com/', { method: 'POST' })
+    );
+    deepStrictEqual(n, 1);
+    // custom shouldRetry opts POST in
+    n = 0;
+    const fPost = mftch.retry(
+      async (url) => {
+        if (++n < 2) throw new Error('x');
+        return fakeRes({ url, body: 'ok' });
+      },
+      { baseDelay: 1, shouldRetry: () => true }
+    );
+    deepStrictEqual(await (await fPost('https://x.com/', { method: 'POST' })).text(), 'ok');
+    deepStrictEqual(n, 2);
+    // Retry-After overrides computed backoff (here: no wait instead of 1s base delay)
+    n = 0;
+    const t0 = Date.now();
+    const fRA = mftch.retry(
+      async (url) => {
+        if (++n < 2)
+          return fakeRes({ url, status: 429, statusText: 'TMR', headers: { 'retry-after': '0' } });
+        return fakeRes({ url, body: 'ok' });
+      },
+      { baseDelay: 1000, maxDelay: 2000 }
+    );
+    deepStrictEqual(await (await fRA('https://x.com/')).text(), 'ok');
+    deepStrictEqual(Date.now() - t0 < 500, true);
+    throws(() => mftch.retry(flaky, { attempts: 0 }));
   });
 });
 

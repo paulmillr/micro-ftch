@@ -41,20 +41,25 @@ await net('https://user:pwd@httpbin.org/basic-auth/user/pwd');
 
 - [ftch](#ftch)
   - [isValidRequest](#isValidRequest)
+  - [allowedHosts](#allowedHosts)
   - [log](#log)
   - [timeout](#timeout)
   - [concurrencyLimit](#concurrencyLimit)
+  - [rps](#rps)
+  - [maxBodySize](#maxBodySize)
   - [Basic auth](#basic-auth)
 - [jsonrpc](#jsonrpc)
 - [replayable](#replayable)
+- [retry](#retry)
 - [Privacy](#privacy)
 - [License](#license)
 
-There are three wrappers over `fetch()`:
+There are four wrappers over `fetch()`:
 
-1. `ftch(fetch)` - isValidRequest, logging, timeouts, concurrency limits, basic auth
+1. `ftch(fetch)` - isValidRequest, allowed hosts, logging, timeouts, concurrency & rate limits, body size limits, basic auth
 2. `jsonrpc(fetch)` - batched JSON-RPC functionality
 3. `replayable(fetch)` - log & replay network requests without actually calling network code.
+4. `retry(fetch)` - retries failed requests with exponential backoff and jitter.
 
 ## ftch
 
@@ -75,6 +80,21 @@ ENABLED = false;
 f('http://localhost'); // throws
 ENABLED = true;
 f('http://localhost'); // ok
+```
+
+### allowedHosts
+
+Declarative host allowlist, harder to get wrong than a hand-written URL predicate.
+Checked before `isValidRequest`, re-checked on the final (post-redirect) URL,
+and rejects relative URLs whose host cannot be verified.
+Entries match `URL.hostname` (`example.com`, any port) or `URL.host` (`example.com:8443`, exact port).
+
+```ts
+import { ftch } from 'micro-ftch';
+
+const f = ftch(fetch, { allowedHosts: ['rpc.example.com', 'localhost:8545'] });
+f('https://rpc.example.com/'); // ok
+f('https://evil.com/'); // throws
 ```
 
 ### log
@@ -111,6 +131,29 @@ import { ftch } from 'micro-ftch';
 // browser and OS may have additional limits, we cannot override them
 const f = ftch(fetch, { concurrencyLimit: 1 });
 const res = await Promise.all([f('http://url1/'), f('http://url2/')]); // these would be processed sequentially
+```
+
+### rps
+
+Rate limit: at most this many requests start per second. Complements `concurrencyLimit`
+(which caps in-flight requests, not request rate) for providers with per-second quotas.
+
+```ts
+import { ftch } from 'micro-ftch';
+
+const f = ftch(fetch, { rps: 10 }); // request starts are spaced >= 100ms apart
+```
+
+### maxBodySize
+
+Maximum response body size in bytes, 1 GiB by default. Since ftch buffers whole bodies,
+an unbounded response is an OOM vector; oversized responses are aborted mid-transfer.
+Pass `Infinity` to disable.
+
+```ts
+import { ftch } from 'micro-ftch';
+
+const f = ftch(fetch, { maxBodySize: 10 * 1024 * 1024 }); // 10 MiB
 ```
 
 ### Basic auth
@@ -162,7 +205,32 @@ const replayTestOffline = replayable(ftch, JSON.parse(logs), {
 });
 await replayTestOffline('http://url/1'); // cached
 await replayTestOffline('http://url/2'); // cached
-await replayTestOffline('http://url/3'); // throws!
+await replayTestOffline('http://url/3'); // throws! (error names the closest logged request)
+```
+
+Captured entries record response metadata (`status`, `statusText`, `headers`) alongside the
+body, so error handling can be replay-tested too. Old body-only log files still replay,
+with default `200 OK` metadata. Binary bodies that don't survive a UTF-8 round-trip are
+stored base64-encoded automatically; text bodies stay readable in exported logs.
+
+### retry
+
+Retries failed requests with exponential backoff, full jitter and `Retry-After` support.
+The default policy only retries safe methods (GET/HEAD/OPTIONS) — retrying a POST can
+duplicate a non-idempotent action — and only on thrown errors or status 408/429/5xx.
+Non-ok responses that exhaust attempts are returned, not thrown, like fetch.
+
+```ts
+import { ftch, jsonrpc, retry } from 'micro-ftch';
+
+const net = retry(ftch(fetch), { attempts: 3, baseDelay: 100, maxDelay: 5000 });
+await net('https://example.com'); // up to 3 attempts
+
+// JSON-RPC uses POST: opt in explicitly
+const rpcNet = retry(ftch(fetch), {
+  shouldRetry: (ctx) => ctx.error !== undefined || ctx.status === 429 || ctx.status >= 500,
+});
+const rpc = jsonrpc(rpcNet, 'http://rpc_node/', { batchSize: 20 });
 ```
 
 ## Privacy
