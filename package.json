@@ -4,24 +4,21 @@
   "description": "Wrappers for built-in fetch() enabling killswitch, logging, concurrency limit and other features",
   "files": [
     "index.js",
-    "index.js.map",
     "index.d.ts",
-    "index.d.ts.map",
     "index.ts"
   ],
   "devDependencies": {
-    "@paulmillr/jsbt": "0.6.2",
+    "@paulmillr/jsbt": "0.6.5",
     "@types/node": "25.3.0",
     "prettier": "3.6.2",
     "typescript": "6.0.2"
   },
   "scripts": {
+    "benchmark:size": "npx bismar@0.1 -bs",
     "build": "tsc",
-    "build:release": "npx --no @paulmillr/jsbt bundle test/build",
-    "check": "npx --no @paulmillr/jsbt check",
+    "check": "jsbt-check",
     "format": "prettier --write index.ts",
-    "test": "node --experimental-strip-types --no-warnings test/index.ts",
-    "test:bun": "bun test/index.ts",
+    "test": "node test/index.ts",
     "test:deno": "deno --allow-env --allow-net test/index.ts"
   },
   "keywords": [

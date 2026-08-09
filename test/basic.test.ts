@@ -1,4 +1,4 @@
-import { describe, should } from '@paulmillr/jsbt/test.js';
+import { describe, it } from '@paulmillr/jsbt/test.js';
 import { deepStrictEqual, rejects, throws } from 'node:assert';
 import { Buffer } from 'node:buffer';
 import { createServer } from 'node:http';
@@ -62,7 +62,7 @@ describe('Network', () => {
           resolve(value);
         }, delay)
       );
-    should('limit(2)', async () => {
+    it('limit(2)', async () => {
       const ts = Date.now();
       const limit2 = limit(2);
       const log = [];
@@ -74,7 +74,7 @@ describe('Network', () => {
       deepStrictEqual(Date.now() - ts >= 200, true);
       deepStrictEqual(log, [1, 2, 3]);
     });
-    should('limit(1), order', async () => {
+    it('limit(1), order', async () => {
       const limit1 = limit(1);
       const log = [];
       await Promise.all([
@@ -84,7 +84,7 @@ describe('Network', () => {
       ]);
       deepStrictEqual(log, [1, 2, 3]);
     });
-    should('limit(2), order', async () => {
+    it('limit(2), order', async () => {
       const limit2 = limit(2);
       const log = [];
       await Promise.all([
@@ -94,7 +94,7 @@ describe('Network', () => {
       ]);
       deepStrictEqual(log, [1, 3, 2]);
     });
-    should('limit(3), order', async () => {
+    it('limit(3), order', async () => {
       const limit3 = limit(3);
       const log = [];
       await Promise.all([
@@ -104,7 +104,7 @@ describe('Network', () => {
       ]);
       deepStrictEqual(log, [3, 1, 2]);
     });
-    should('error', async () => {
+    it('error', async () => {
       const limit1 = limit(1);
       const log = [];
       limit1(() => delayed(1, 10, log));
@@ -124,7 +124,7 @@ describe('Network', () => {
       deepStrictEqual(p5, 3);
       deepStrictEqual(log, [1, 2, 3]);
     });
-    should('invalid concurrency limit', async () => {
+    it('invalid concurrency limit', async () => {
       throws(() => limit(0), { message: 'expected concurrencyLimit > 0, got 0' });
       throws(() => limit(-1), { message: 'expected concurrencyLimit > 0, got -1' });
       throws(() => mftch.ftch(fetch, { concurrencyLimit: 0 }), {
@@ -137,7 +137,7 @@ describe('Network', () => {
   });
   if (REAL_NETWORK) {
     describe('Real network', () => {
-      should('Basic req', async () => {
+      it('Basic req', async () => {
         const ftch = mftch.ftch(fetch);
         const res = await ftch('https://httpbin.org/json');
         deepStrictEqual(res.ok, true);
@@ -173,7 +173,7 @@ describe('Network', () => {
           },
         });
       });
-      should('Headers (class)', async () => {
+      it('Headers (class)', async () => {
         const ftch = mftch.ftch(fetch);
         const reqs = await Promise.all([
           // Class
@@ -206,7 +206,7 @@ describe('Network', () => {
         }
       });
 
-      should('Basic auth', async () => {
+      it('Basic auth', async () => {
         const ftch = mftch.ftch(fetch);
         const res = await ftch('https://user:pwd@httpbin.org/basic-auth/user/pwd');
         deepStrictEqual(await res.json(), { authenticated: true, user: 'user' });
@@ -218,7 +218,7 @@ describe('Network', () => {
     });
   }
 
-  should('ftch', async () => {
+  it('ftch', async () => {
     const serverLog = [];
     const { stop, url } = await httpServer(8001, async (r) => {
       if (r.sleep) await sleep(r.sleep);
@@ -429,7 +429,7 @@ describe('Network', () => {
     serverLog.splice(0, serverLog.length);
     await stop();
   });
-  should('jsonrpc', async () => {
+  it('jsonrpc', async () => {
     const serverLog = [];
     const { stop, url } = await httpServer(8002, async (r, headers) => {
       serverLog.push({ r, headers: cleanHeaders(headers) });
@@ -592,7 +592,7 @@ describe('Network', () => {
     ]);
     await stop();
   });
-  should('replayable', async () => {
+  it('replayable', async () => {
     const serverLog = [];
     const { stop, url } = await httpServer(8003, async (r) => {
       if (r.sleep) await sleep(r.sleep);
@@ -640,7 +640,7 @@ describe('Network', () => {
     deepStrictEqual(serverLog, [1, 2, 3]);
     await stop();
   });
-  should('replayable without request opts', async () => {
+  it('replayable without request opts', async () => {
     const fetchFn: mftch.FetchFn = async (url, opts = {}) => {
       const body = JSON.stringify({ url, method: opts.method || 'GET' });
       return {
@@ -670,7 +670,7 @@ describe('Network', () => {
       },
     });
   });
-  should('replayable header key casing', async () => {
+  it('replayable header key casing', async () => {
     const fetchFn: mftch.FetchFn = async (url, opts = {}) => {
       const headers = new Headers(opts.headers);
       const body = JSON.stringify({ url, contentType: headers.get('content-type') });
@@ -705,7 +705,7 @@ describe('Network', () => {
       });
     }
   });
-  should('replayable empty text body', async () => {
+  it('replayable empty text body', async () => {
     const fetchFn: mftch.FetchFn = async (url) => ({
       headers: new Headers(),
       ok: true,
@@ -755,7 +755,7 @@ describe('Wrappers v1.1', () => {
       arrayBuffer: async () => new TextEncoder().encode(body).buffer,
     };
   };
-  should('allowedHosts', async () => {
+  it('allowedHosts', async () => {
     const calls = [];
     const fetchFn = async (url) => {
       calls.push(url);
@@ -790,7 +790,7 @@ describe('Wrappers v1.1', () => {
     await rejects(() => fRedir('https://example.com/'), /host not allowed/);
     throws(() => mftch.ftch(fetchFn, { allowedHosts: 'example.com' as any }));
   });
-  should('maxBodySize', async () => {
+  it('maxBodySize', async () => {
     const body = 'a'.repeat(100);
     const mkFetch = (headers) => async (url) => fakeRes({ url, body, headers });
     // Content-Length fast reject
@@ -823,7 +823,7 @@ describe('Wrappers v1.1', () => {
     deepStrictEqual(await ok.text(), 'aaaabbbb');
     throws(() => mftch.ftch(mkFetch({}), { maxBodySize: 0 }));
   });
-  should('rps', async () => {
+  it('rps', async () => {
     const starts = [];
     const f = mftch.ftch(
       async (url) => {
@@ -839,7 +839,7 @@ describe('Wrappers v1.1', () => {
       deepStrictEqual(gap >= 40, true, `expected gap >= 40ms, got ${gap}`);
     throws(() => mftch.ftch(async (url) => fakeRes({ url }), { rps: 0 }));
   });
-  should('replayable response metadata', async () => {
+  it('replayable response metadata', async () => {
     const fetchFn = async (url) =>
       fakeRes({ url, status: 404, statusText: 'Not Found', headers: { 'x-a': '1' }, body: 'missing' });
     const live = mftch.replayable(fetchFn);
@@ -862,7 +862,7 @@ describe('Wrappers v1.1', () => {
     // Misses in offline mode point at the most similar logged key
     await rejects(() => offline('https://example.com/405'), /closest logged request/);
   });
-  should('retry', async () => {
+  it('retry', async () => {
     // network errors retried, succeeds on 3rd attempt
     let n = 0;
     const flaky = async (url) => {
@@ -939,4 +939,4 @@ describe('Wrappers v1.1', () => {
   });
 });
 
-should.runWhen(import.meta.url);
+it.runWhen(import.meta.url);
