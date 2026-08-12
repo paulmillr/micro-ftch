@@ -40,6 +40,33 @@
 // Awaiting for promise is equal to node nextTick
 const nextTick = async () => {};
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const DEFAULT_SENSITIVE_HEADERS = [
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'api-key',
+  'x-auth-token',
+] as const;
+const DEFAULT_SENSITIVE_FIELDS = [
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'access-token',
+  'refresh-token',
+  'api-key',
+  'client-secret',
+  'private-key',
+  'session-id',
+] as const;
+const REDACTED = '[REDACTED]';
+const normalizeSensitiveName = (name: string) => name.toLowerCase().replace(/[-_]/g, '');
+function validateStringList(value: unknown, name: string): asserts value is string[] | undefined {
+  if (value !== undefined && (!Array.isArray(value) || value.some((v) => typeof v !== 'string')))
+    throw new Error(`${name} must be an array of strings`);
+}
 // btoa/atob are Latin-1 only: convert through raw bytes, chunked to avoid arg-spread limits.
 function bytesToBase64(bytes: Uint8Array): string {
   let bin = '';
@@ -56,7 +83,7 @@ function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
 // Small internal primitive to limit concurrency
 function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T> {
   // Non-positive limits cannot start queued work and would leave callers pending.
-  if (concurrencyLimit <= 0)
+  if (!Number.isSafeInteger(concurrencyLimit) || concurrencyLimit <= 0)
     throw new Error(`expected concurrencyLimit > 0, got ${concurrencyLimit}`);
   let currentlyProcessing = 0;
   const queue: ((value?: unknown) => void)[] = [];
@@ -131,24 +158,42 @@ export type FetchFn = (
 /** Options for `ftch`. */
 export type FtchOpts = {
   /**
-   * Returns `false` to block a request before or after it runs.
+   * Returns (or resolves to) `false` to block a request before or after it runs.
    * @param url - Request URL about to be fetched.
    * @returns `true` when the request should be allowed.
    */
-  isValidRequest?: (url?: string) => boolean;
+  isValidRequest?: (url?: string) => boolean | Promise<boolean>;
   /**
    * Alias for `isValidRequest`.
    * @param url - Request URL about to be fetched.
    * @returns `true` when the request should be allowed.
    */
-  killswitch?: (url?: string) => boolean;
+  killswitch?: (url?: string) => boolean | Promise<boolean>;
   /**
-   * Only allow requests to these hosts. Entries match `URL.hostname` (`example.com`) or
-   * `URL.host` (`example.com:8443`), case-insensitive. Checked before `isValidRequest`,
-   * re-checked on the final (post-redirect) URL, and rejects relative URLs whose host
-   * cannot be verified.
+   * One-shot network killswitch. Aborting the signal immediately aborts active requests and
+   * blocks queued and future requests made by this wrapper. Create a new wrapper to re-enable it.
+   */
+  killswitchSignal?: AbortSignal;
+  /**
+   * Only allow requests to these exact origins. A hostname entry (`example.com`) defaults to
+   * HTTPS on port 443. Include a port (`example.com:8443`) to permit another HTTPS port, or
+   * include a scheme (`http://example.com:8080`) to explicitly permit HTTP. Matching is
+   * case-insensitive. Checked before `isValidRequest` and rejects relative URLs.
+   * Absolute HTTP(S) redirects are followed by the wrapper itself (unless the caller passes
+   * `redirect: 'manual'` or `'error'`), one hop at a time, with every hop's origin and
+   * `isValidRequest` verdict checked BEFORE its request is sent. Cross-origin hops drop
+   * `Authorization`, `Cookie`, and `Proxy-Authorization` headers. Capped at 20 hops, like fetch.
+   * This validates URL origins, not resolved IP addresses, and is not a complete SSRF sandbox;
+   * use trusted DNS resolution and network-level egress controls across a security boundary.
    */
   allowedHosts?: string[];
+  /**
+   * Permit HTTPS-to-HTTP redirects. Default: `false`. The HTTP landing origin must still be
+   * present in `allowedHosts` when an allowlist is configured.
+   */
+  allowInsecureRedirects?: boolean;
+  /** Additional request headers to strip on cross-origin redirects. */
+  sensitiveHeaders?: string[];
   /** Maximum number of wrapped requests allowed to run at once. */
   concurrencyLimit?: number;
   /** Maximum request starts per second. */
@@ -158,10 +203,11 @@ export type FtchOpts = {
    * Default: 1 GiB. Pass `Infinity` to disable.
    */
   maxBodySize?: number;
-  /** Default timeout in milliseconds for wrapped requests. */
+  /** Default finite, non-negative timeout in milliseconds for wrapped requests. */
   timeout?: number;
   /**
-   * Observes every request before it is sent.
+   * Observes every request before it is sent. Receives a shallow snapshot of the actual
+   * per-hop options, including redirect rewrites, with a cloned `Headers` object.
    * @param url - Request URL.
    * @param opts - Request options passed to the wrapped fetch. See {@link FetchOpts}.
    */
@@ -169,11 +215,23 @@ export type FtchOpts = {
 };
 
 type UnPromise<T> = T extends Promise<infer U> ? U : T;
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal, onAbort = () => {}): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => {
+      onAbort();
+      reject(signal.reason ?? new Error('request aborted'));
+    };
+    if (signal.aborted) return aborted();
+    signal.addEventListener('abort', aborted, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+  });
+}
 // NOTE: we don't expose actual request to make sure there is no way to trigger actual network code
 // from wrapped function
 // ftch buffers whole bodies by design (see NOTE in ftch), which makes an unbounded response an
 // OOM vector: enforce the cap while reading. Content-Length is a fast reject for honest servers;
-// streaming catches liars; the arrayBuffer fallback (non-stream FetchFns) can only check after the fact.
+// streaming catches liars; the arrayBuffer fallback for non-stream FetchFns can only check
+// after the fact.
 async function readBodyLimited(
   req: UnPromise<ReturnType<FetchFn>>,
   maxBodySize: number,
@@ -191,7 +249,9 @@ async function readBodyLimited(
     const chunks: Uint8Array[] = [];
     let total = 0;
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await raceAbort(reader.read(), abort.signal, () => {
+        reader.cancel(abort.signal.reason).catch(() => {});
+      });
       if (done) break;
       total += value.length;
       if (total > maxBodySize) {
@@ -208,7 +268,7 @@ async function readBodyLimited(
     }
     return body;
   }
-  const body = new Uint8Array(await req.arrayBuffer());
+  const body = new Uint8Array(await raceAbort(req.arrayBuffer(), abort.signal));
   if (body.length > maxBodySize) throw tooBig();
   return body;
 }
@@ -271,95 +331,254 @@ const getRequestInfo = (req: UnPromise<ReturnType<FetchFn>>) => ({
  * ```
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
-  const ks = opts.isValidRequest || opts.killswitch;
-  if (ks && typeof ks !== 'function') throw new Error('opts.isValidRequest must be a function');
-  const noNetwork = (url: string) => ks && !ks(url);
+  if (opts.isValidRequest !== undefined && typeof opts.isValidRequest !== 'function')
+    throw new Error('opts.isValidRequest must be a function');
+  if (opts.killswitch !== undefined && typeof opts.killswitch !== 'function')
+    throw new Error('opts.killswitch must be a function');
+  const killswitchSignal = opts.killswitchSignal;
+  if (
+    killswitchSignal !== undefined &&
+    (typeof killswitchSignal.aborted !== 'boolean' ||
+      typeof killswitchSignal.addEventListener !== 'function' ||
+      typeof killswitchSignal.removeEventListener !== 'function')
+  )
+    throw new Error('opts.killswitchSignal must be an AbortSignal');
+  validateStringList(opts.sensitiveHeaders, 'opts.sensitiveHeaders');
+  const redirectSensitiveHeaders = new Set<string>(DEFAULT_SENSITIVE_HEADERS);
+  for (const name of opts.sensitiveHeaders || []) {
+    // Let the platform enforce the Fetch header-name grammar at construction time.
+    const normalized = new Headers([[name, '']]);
+    for (const normalizedName of normalized.keys()) redirectSensitiveHeaders.add(normalizedName);
+  }
+  const ks = opts.isValidRequest ?? opts.killswitch;
+  const noNetwork = async (url: string) => {
+    if (killswitchSignal?.aborted) return true;
+    if (ks !== undefined && !(await ks(url))) return true;
+    return killswitchSignal?.aborted === true;
+  };
   if (
     opts.allowedHosts !== undefined &&
     (!Array.isArray(opts.allowedHosts) || opts.allowedHosts.some((h) => typeof h !== 'string'))
   )
     throw new Error('opts.allowedHosts must be an array of strings');
-  const hosts =
-    opts.allowedHosts === undefined ? undefined : opts.allowedHosts.map((h) => h.toLowerCase());
-  const hostOk = (parsed: URL) =>
-    hosts === undefined || hosts.includes(parsed.hostname) || hosts.includes(parsed.host);
+  if (opts.allowInsecureRedirects !== undefined && typeof opts.allowInsecureRedirects !== 'boolean')
+    throw new Error('opts.allowInsecureRedirects must be a boolean');
+  const origins = opts.allowedHosts?.map((host) => {
+    if (host.length === 0 || host.trim() !== host)
+      throw new Error('allowedHosts: invalid host entry: ' + host);
+    let parsed: URL;
+    try {
+      const hasScheme = /^[a-z][a-z\d+.-]*:\/\//i.test(host);
+      if (!hasScheme && /[\\/?#@]/.test(host)) throw new Error('invalid host');
+      parsed = new URL(hasScheme ? host : 'https://' + host);
+    } catch {
+      throw new Error('allowedHosts: invalid host entry: ' + host);
+    }
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password ||
+      parsed.href !== parsed.origin + '/'
+    )
+      throw new Error('allowedHosts: invalid host entry: ' + host);
+    // URL.origin normalizes case, IDNs, IPv6, and explicit default ports.
+    return parsed.origin;
+  });
+  const hostOk = (parsed: URL) => origins === undefined || origins.includes(parsed.origin);
   // Checked before isValidRequest: the declarative allowlist must not be bypassable by hook logic.
   const checkHost = (parsed: URL | undefined, url: string) => {
-    if (hosts === undefined) return;
+    if (origins === undefined) return;
     if (parsed === undefined)
       throw new Error('allowedHosts: cannot verify host of relative URL: ' + url);
-    if (!hostOk(parsed)) throw new Error('allowedHosts: host not allowed: ' + parsed.host);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+      throw new Error('allowedHosts: scheme not allowed: ' + parsed.protocol);
+    if (!hostOk(parsed))
+      throw new Error(
+        `allowedHosts: host not allowed: ${parsed.host}; exact origin not allowed: ${parsed.origin}`
+      );
   };
   const maxBodySize = opts.maxBodySize === undefined ? 1024 ** 3 : opts.maxBodySize;
   if (!(maxBodySize > 0)) throw new Error(`expected maxBodySize > 0, got ${maxBodySize}`);
+  if (opts.timeout !== undefined && (!Number.isFinite(opts.timeout) || opts.timeout < 0))
+    throw new Error(`expected timeout to be a finite non-negative number, got ${opts.timeout}`);
   const wrappedFetch: FetchFn = async (url, reqOpts = {}) => {
     const abort = new AbortController();
-    const callerSignal = reqOpts.signal;
     let cleanupCallerSignal = () => {};
-    if (callerSignal) {
-      // Keep one internal signal for timeout and late killswitch aborts, while preserving caller aborts.
-      const abortCaller = () => abort.abort(callerSignal.reason);
-      if (callerSignal.aborted) abortCaller();
-      else {
-        callerSignal.addEventListener('abort', abortCaller, { once: true });
-        cleanupCallerSignal = () => callerSignal.removeEventListener('abort', abortCaller);
+    let cleanupKillswitchSignal = () => {};
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Runtime callers are not necessarily type-checked. Coerce once so an object cannot validate
+      // as one URL and then stringify differently when it reaches fetch.
+      url = String(url);
+      const callerSignal = reqOpts.signal;
+      if (callerSignal) {
+        // Keep one internal signal for timeout and late killswitch aborts, while preserving caller aborts.
+        const abortCaller = () => abort.abort(callerSignal.reason);
+        if (callerSignal.aborted) abortCaller();
+        else {
+          callerSignal.addEventListener('abort', abortCaller, { once: true });
+          cleanupCallerSignal = () => callerSignal.removeEventListener('abort', abortCaller);
+        }
       }
-    }
-    let timeout = undefined;
-    if (opts.timeout !== undefined || reqOpts.timeout !== undefined) {
-      const ms = reqOpts.timeout !== undefined ? reqOpts.timeout : opts.timeout;
-      timeout = setTimeout(() => abort.abort(), ms);
-    }
-    const headers = new Headers(); // We cannot re-use object from user since we may modify it
-    let parsed: URL | undefined;
-    try {
-      parsed = new URL(url);
-    } catch {
-      // Relative URL: fetch resolves it against the document base; there is no userinfo to extract.
-    }
-    if (parsed && (parsed.username || parsed.password)) {
-      // RFC 7617 §2 builds `user-pass` as user-id ":" password; RFC 3986 §3.2.1 deprecates user:password in URI userinfo, so strip it after converting.
-      // URL exposes userinfo percent-encoded, and credentials may be non-Latin-1: decode, then base64 the UTF-8 bytes.
-      const user = decodeURIComponent(parsed.username);
-      const pass = decodeURIComponent(parsed.password);
-      const auth = bytesToBase64(new TextEncoder().encode(`${user}:${pass}`));
-      headers.set('Authorization', `Basic ${auth}`);
-      parsed.username = '';
-      parsed.password = '';
-      url = '' + parsed;
-    }
-    if (reqOpts.headers) {
-      const h = reqOpts.headers instanceof Headers ? reqOpts.headers : new Headers(reqOpts.headers);
-      h.forEach((v, k) => headers.set(k, v));
-    }
-    checkHost(parsed, url);
-    if (noNetwork(url)) throw new Error('network disabled');
-    if (opts.log) opts.log(url, reqOpts);
-    try {
-      const res = await fetchFunction(url, {
-        referrerPolicy: 'no-referrer', // avoid sending referrer by default
-        ...reqOpts,
-        headers,
-        signal: abort.signal,
-      });
-      if (noNetwork(url)) {
+      if (killswitchSignal) {
+        const abortNetwork = () => abort.abort(killswitchSignal.reason);
+        if (killswitchSignal.aborted) abortNetwork();
+        else {
+          killswitchSignal.addEventListener('abort', abortNetwork, { once: true });
+          cleanupKillswitchSignal = () =>
+            killswitchSignal.removeEventListener('abort', abortNetwork);
+        }
+      }
+      if (opts.timeout !== undefined || reqOpts.timeout !== undefined) {
+        const ms = reqOpts.timeout !== undefined ? reqOpts.timeout : opts.timeout!;
+        if (!Number.isFinite(ms) || ms < 0)
+          throw new Error(`expected timeout to be a finite non-negative number, got ${ms}`);
+        timeout = setTimeout(() => abort.abort(), ms);
+      }
+      const headers = new Headers(); // We cannot re-use object from user since we may modify it
+      let parsed: URL | undefined;
+      try {
+        parsed = new URL(url);
+      } catch {
+        // Relative URL: fetch resolves it against the document base; there is no userinfo to extract.
+      }
+      if (parsed && (parsed.username || parsed.password)) {
+        // RFC 7617 §2 builds `user-pass` as user-id ":" password; RFC 3986 §3.2.1 deprecates user:password in URI userinfo, so strip it after converting.
+        // URL exposes userinfo percent-encoded, and credentials may be non-Latin-1: decode, then base64 the UTF-8 bytes.
+        const user = decodeURIComponent(parsed.username);
+        const pass = decodeURIComponent(parsed.password);
+        const auth = bytesToBase64(new TextEncoder().encode(`${user}:${pass}`));
+        headers.set('Authorization', `Basic ${auth}`);
+        parsed.username = '';
+        parsed.password = '';
+        url = parsed.href;
+      }
+      if (reqOpts.headers) {
+        const h =
+          reqOpts.headers instanceof Headers ? reqOpts.headers : new Headers(reqOpts.headers);
+        h.forEach((v, k) => headers.set(k, v));
+      }
+      checkHost(parsed, url);
+      if (await noNetwork(url)) throw new Error('network disabled');
+      // Walk absolute HTTP(S) redirects one hop at a time. This lets the wrapper reject
+      // disallowed origins and HTTPS downgrades BEFORE the redirected request is sent.
+      // Callers that pass `redirect: 'manual'`/`'error'` keep their semantics.
+      const selfFollow =
+        parsed !== undefined &&
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        (reqOpts.redirect === undefined || reqOpts.redirect === 'follow');
+      const hopOpts: FetchOpts = { referrerPolicy: 'no-referrer', ...reqOpts };
+      if (selfFollow) hopOpts.redirect = 'manual';
+      hopOpts.headers = headers;
+      hopOpts.signal = abort.signal;
+      let target = url;
+      // selfFollow requires a parsed absolute HTTP(S) URL, so `current` is defined in the loop.
+      let current = parsed!;
+      let hops = 0;
+      let res!: UnPromise<ReturnType<FetchFn>>;
+      let responseUrl = target;
+      for (;;) {
+        // Report actual per-hop options; clone the object and Headers so common logger
+        // mutations cannot change the request being sent.
+        if (opts.log) opts.log(target, { ...hopOpts, headers: new Headers(headers) });
+        res = await fetchFunction(target, hopOpts);
+        const reportedUrl = res.url;
+        responseUrl = reportedUrl || target;
+        if ((origins !== undefined || selfFollow) && reportedUrl) {
+          // Belt and braces for non-conforming FetchFn implementations that ignore
+          // `redirect: 'manual'`: validate the reported URL before hooks or body reads.
+          let finalUrl: URL;
+          try {
+            finalUrl = new URL(reportedUrl);
+          } catch {
+            abort.abort('invalid response URL');
+            throw new Error('allowedHosts: cannot verify host of response URL: ' + reportedUrl);
+          }
+          if (finalUrl.protocol !== 'http:' && finalUrl.protocol !== 'https:') {
+            abort.abort('redirect scheme not allowed');
+            throw new Error('redirect: scheme not allowed: ' + finalUrl.protocol);
+          }
+          if (
+            current.protocol === 'https:' &&
+            finalUrl.protocol === 'http:' &&
+            opts.allowInsecureRedirects !== true
+          ) {
+            abort.abort('insecure redirect');
+            throw new Error('redirect: HTTPS to HTTP downgrade not allowed: ' + reportedUrl);
+          }
+          try {
+            checkHost(finalUrl, reportedUrl);
+          } catch (error) {
+            abort.abort('response URL not allowed');
+            throw error;
+          }
+        }
+        if (await noNetwork(responseUrl)) {
+          abort.abort('network disabled');
+          throw new Error('network disabled');
+        }
+        if (!selfFollow || ![301, 302, 303, 307, 308].includes(res.status)) break;
+        const location = res.headers.get('location');
+        if (!location) break;
+        // The hop's body is never read; release its socket.
+        res.body?.cancel().catch(() => {});
+        if (++hops > 20) throw new Error('too many redirects: ' + url);
+        // Relative locations resolve against the hop that issued them.
+        const next = new URL(location, current);
+        if (next.protocol !== 'http:' && next.protocol !== 'https:')
+          throw new Error('redirect: scheme not allowed: ' + next.protocol);
+        if (
+          current.protocol === 'https:' &&
+          next.protocol === 'http:' &&
+          opts.allowInsecureRedirects !== true
+        )
+          throw new Error('redirect: HTTPS to HTTP downgrade not allowed: ' + next.href);
+        // Fetch spec: credentials never ride a redirect, and Authorization
+        // must not leak to a different origin.
+        if (next.username || next.password)
+          throw new Error('redirect carries credentials: ' + next.host);
+        if (current.origin !== next.origin) {
+          // No cookie jar here: manually set credentials and API keys would otherwise
+          // ride to a different allowed origin.
+          for (const name of redirectSensitiveHeaders) headers.delete(name);
+        }
+        // Fetch rewrites POST after 301/302, and non-GET/HEAD after 303, as a bodyless GET.
+        const method = (hopOpts.method || 'GET').toUpperCase();
+        if (
+          ((res.status === 301 || res.status === 302) && method === 'POST') ||
+          (res.status === 303 && method !== 'GET' && method !== 'HEAD')
+        ) {
+          hopOpts.method = 'GET';
+          delete hopOpts.body;
+          for (const name of [
+            'Content-Encoding',
+            'Content-Language',
+            'Content-Location',
+            'Content-Type',
+          ])
+            headers.delete(name);
+        }
+        target = '' + next;
+        checkHost(next, target); // pre-send, exactly like the first hop
+        // The hook sees every hop URL too — a redirect inside the allowlist must
+        // not smuggle past URL-based hook logic (and a killswitch flipped
+        // mid-chain stops the chain now, not after the last hop).
+        if (await noNetwork(target)) {
+          abort.abort('network disabled');
+          throw new Error('network disabled');
+        }
+        current = next;
+      }
+      const body = await readBodyLimited(res, maxBodySize, abort);
+      if (await noNetwork(responseUrl)) {
         abort.abort('network disabled');
         throw new Error('network disabled');
       }
-      if (hosts !== undefined && res.url) {
-        // Redirects can land on a different host; re-verify the final URL before reading the body.
-        let finalUrl: URL | undefined;
-        try {
-          finalUrl = new URL(res.url);
-        } catch {}
-        if (finalUrl !== undefined && !hostOk(finalUrl)) {
-          abort.abort('redirect to disallowed host');
-          throw new Error('allowedHosts: host not allowed: ' + finalUrl.host);
-        }
-      }
-      const body = await readBodyLimited(res, maxBodySize, abort);
       return {
         ...getRequestInfo(res),
+        // Self-followed hops report like fetch's own follow would.
+        ...(hops > 0 ? { redirected: true, url: responseUrl } : {}),
         // NOTE: this disables streaming parser and fetches whole body on request (instead of headers only as done in fetch)
         // But this allows to intercept and disable request if killswitch enabled. Also required for concurrency limit,
         // since actual request is not finished
@@ -370,6 +589,7 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
       cleanupCallerSignal();
+      cleanupKillswitchSignal();
     }
   };
   // rps sits closest to the network so actual request starts stay spaced; concurrencyLimit wraps it.
@@ -468,6 +688,8 @@ export class JsonrpcProvider implements JsonrpcInterface {
     this.fetchFunction = fetchFunction;
     this.rpcUrl = rpcUrl;
     this.batchSize = options.batchSize === undefined ? 1 : options.batchSize;
+    if (!Number.isSafeInteger(this.batchSize) || this.batchSize <= 0)
+      throw new Error(`expected batchSize to be a positive integer, got ${this.batchSize}`);
     this.headers = options.headers || {};
     if (typeof this.headers !== 'object') throw new Error('invalid headers: expected object');
   }
@@ -623,12 +845,27 @@ function closestKey(key: string, keys: string[]): string | undefined {
   return best;
 }
 
+/** Additional replay-log redaction rules. Default sensitive names remain enabled. */
+export type ReplayRedactionOpts = {
+  /** Additional case-insensitive request/response header names to redact. */
+  headers?: string[];
+  /** Additional case-insensitive JSON field or URL query-parameter names to redact recursively. */
+  fields?: string[];
+  /** Replacement stored in response headers and JSON bodies. Default: `[REDACTED]`. */
+  replacement?: string;
+};
+
 /** Options for replayable(). */
 export type ReplayOpts = {
   /** Throw instead of using the wrapped fetch when a request is missing from the log. */
   offline?: boolean;
   /** Custom request-key function used for capture and replay. */
   getKey?: GetKeyFn;
+  /**
+   * Redaction rules. Enabled by default for credentials, cookies, API keys, and common secret
+   * JSON/query fields. Pass `false` only for trusted legacy fixtures that require raw values.
+   */
+  redact?: false | ReplayRedactionOpts;
 };
 
 /** replayable() return function, with additional logging helpers. */
@@ -667,15 +904,181 @@ function decodeBody(stored: string): Uint8Array<ArrayBuffer> {
   return new TextEncoder().encode(stored);
 }
 
-const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
+type ReplayRedaction = {
+  headers: Set<string>;
+  fields: Set<string>;
+  replacement: string;
+};
+
+function createReplayRedaction(redact: ReplayOpts['redact']): ReplayRedaction | undefined {
+  if (redact === false) return;
+  if (redact !== undefined && (redact === null || typeof redact !== 'object'))
+    throw new Error('opts.redact must be false or an object');
+  validateStringList(redact?.headers, 'opts.redact.headers');
+  validateStringList(redact?.fields, 'opts.redact.fields');
+  if (redact?.replacement !== undefined && typeof redact.replacement !== 'string')
+    throw new Error('opts.redact.replacement must be a string');
+  const headers = new Set<string>(DEFAULT_SENSITIVE_HEADERS);
+  for (const name of redact?.headers || []) {
+    const normalized = new Headers([[name, '']]);
+    for (const normalizedName of normalized.keys()) headers.add(normalizedName);
+  }
+  const fields = new Set<string>(DEFAULT_SENSITIVE_FIELDS.map(normalizeSensitiveName));
+  for (const name of redact?.fields || []) fields.add(normalizeSensitiveName(name));
+  return { headers, fields, replacement: redact?.replacement ?? REDACTED };
+}
+
+function redactJsonValue(value: unknown, redaction: ReplayRedaction): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  let changed = false;
+  if (Array.isArray(value)) {
+    for (const item of value) changed = redactJsonValue(item, redaction) || changed;
+    return changed;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (redaction.fields.has(normalizeSensitiveName(key))) {
+      Object.defineProperty(value, key, {
+        value: redaction.replacement,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      changed = true;
+    } else {
+      changed = redactJsonValue(item, redaction) || changed;
+    }
+  }
+  return changed;
+}
+
+function redactJsonText(text: string, redaction: ReplayRedaction): string {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  return redactJsonValue(json, redaction) ? JSON.stringify(json) : text;
+}
+
+async function hashSecret(value: string): Promise<string> {
+  if (globalThis.crypto?.subtle === undefined)
+    throw new Error('replay redaction requires Web Crypto SHA-256 support');
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
+    ''
+  );
+  return `[REDACTED sha256:${hex}]`;
+}
+
+async function hashJsonValue(value: unknown, fields: Set<string>): Promise<boolean> {
+  if (value === null || typeof value !== 'object') return false;
+  let changed = false;
+  if (Array.isArray(value)) {
+    for (const item of value) changed = (await hashJsonValue(item, fields)) || changed;
+    return changed;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (fields.has(normalizeSensitiveName(key))) {
+      const serialized = JSON.stringify(item);
+      Object.defineProperty(value, key, {
+        value: await hashSecret(serialized === undefined ? String(item) : serialized),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      changed = true;
+    } else {
+      changed = (await hashJsonValue(item, fields)) || changed;
+    }
+  }
+  return changed;
+}
+
+async function hashJsonText(text: string, fields: Set<string>): Promise<string> {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return text;
+  }
+  return (await hashJsonValue(json, fields)) ? JSON.stringify(json) : text;
+}
+
+async function redactUrlKey(url: string, redaction: ReplayRedaction): Promise<string> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+  let changed = false;
+  if (parsed.username) {
+    parsed.username = await hashSecret(parsed.username);
+    changed = true;
+  }
+  if (parsed.password) {
+    parsed.password = await hashSecret(parsed.password);
+    changed = true;
+  }
+  if (parsed.hash) {
+    parsed.hash = await hashSecret(parsed.hash.slice(1));
+    changed = true;
+  }
+  const params = new URLSearchParams();
+  for (const [name, value] of parsed.searchParams) {
+    if (redaction.fields.has(normalizeSensitiveName(name))) {
+      params.append(name, await hashSecret(value));
+      changed = true;
+    } else {
+      params.append(name, value);
+    }
+  }
+  if (changed) parsed.search = params.toString();
+  return changed ? parsed.href : url;
+}
+
+const getKey = async (
+  url: string,
+  opts: FetchOpts,
+  fn = defaultGetKey,
+  redaction?: ReplayRedaction
+) => {
   // RFC 9110 §5.1: field names are case-insensitive, so replay keys need canonicalized header names.
   const headers: Record<string, string> = {};
   // Headers accepts every HeadersInit shape and normalizes duplicate handling like fetch.
-  new Headers(opts.headers).forEach((v, k) => {
-    headers[normalizeHeader(k)] = v;
-  });
-  return fn(url, { method: opts.method, headers, body: opts.body });
+  for (const [key, value] of new Headers(opts.headers)) {
+    headers[normalizeHeader(key)] =
+      redaction?.headers.has(key) === true ? await hashSecret(value) : value;
+  }
+  const safeUrl = redaction === undefined ? url : await redactUrlKey(url, redaction);
+  const body =
+    redaction !== undefined && typeof opts.body === 'string'
+      ? await hashJsonText(opts.body, redaction.fields)
+      : opts.body;
+  return fn(safeUrl, { method: opts.method, headers, body });
 };
+
+function redactReplayEntry(
+  entry: string | ReplayLogEntry,
+  redaction: ReplayRedaction
+): string | ReplayLogEntry {
+  if (typeof entry === 'string')
+    return entry.startsWith(B64_MARK) ? entry : redactJsonText(entry, redaction);
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(entry.headers))
+    Object.defineProperty(headers, key, {
+      value: redaction.headers.has(key.toLowerCase()) ? redaction.replacement : value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  return {
+    ...entry,
+    headers,
+    body: entry.body.startsWith(B64_MARK) ? entry.body : redactJsonText(entry.body, redaction),
+  };
+}
 
 /**
  * Log & replay network requests without actually calling network code.
@@ -683,6 +1086,7 @@ const getKey = (url: string, opts: FetchOpts, fn = defaultGetKey) => {
  * @param logs - Captured request/response map, usually from `JSON.parse(replay.export())`.
  * @param opts - Replay configuration such as offline mode or custom keying. See {@link ReplayOpts}.
  * @returns Fetch-compatible wrapper with log export helpers.
+ * @throws If replay redaction options are invalid or the runtime lacks Web Crypto support. {@link Error}
  * @example
  * Record live responses once, then export the captured log.
  * ```js
@@ -734,12 +1138,15 @@ export function replayable(
   logs: Record<string, string | ReplayLogEntry> = {},
   opts: ReplayOpts = {}
 ): ReplayFn {
+  const redaction = createReplayRedaction(opts.redact);
   const accessed: Set<string> = new Set();
   const wrapped = async (url: string, reqOpts: FetchOpts = {}) => {
-    const key = getKey(url, reqOpts, opts.getKey);
+    const key = await getKey(url, reqOpts, opts.getKey, redaction);
     accessed.add(key);
-    // Empty-string payloads are valid captures; missing entries must be checked by key presence, not truthiness.
-    if (!(key in logs)) {
+    // Empty-string payloads are valid captures; missing entries must be checked by key presence,
+    // not truthiness — and by OWN key presence: `in` would match Object.prototype members
+    // ('toString', '__proto__') whenever a custom getKey produces such a key.
+    if (!Object.hasOwn(logs, key)) {
       if (opts.offline) {
         const closest = closestKey(key, Object.keys(logs));
         throw new Error(
@@ -758,13 +1165,30 @@ export function replayable(
           bodyPromise = req.arrayBuffer().then((buffer) => {
             const bytes = new Uint8Array(buffer);
             const headers: Record<string, string> = {};
-            info.headers.forEach((v, k) => (headers[k] = v));
-            logs[key] = {
-              status: info.status,
-              statusText: info.statusText,
-              headers,
-              body: encodeBody(bytes),
-            };
+            info.headers.forEach((value, key) =>
+              Object.defineProperty(headers, key, {
+                value: redaction?.headers.has(key) === true ? redaction.replacement : value,
+                enumerable: true,
+                writable: true,
+                configurable: true,
+              })
+            );
+            // defineProperty, not assignment: a '__proto__' key would swap the
+            // log object's prototype instead of storing the capture.
+            Object.defineProperty(logs, key, {
+              value: {
+                status: info.status,
+                statusText: info.statusText,
+                headers,
+                body:
+                  redaction === undefined
+                    ? encodeBody(bytes)
+                    : redactJsonText(encodeBody(bytes), redaction),
+              },
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            });
             return bytes;
           });
         return bodyPromise;
@@ -776,7 +1200,15 @@ export function replayable(
         arrayBuffer: async () => (await readBody()).buffer,
       };
     }
-    const entry = logs[key];
+    const rawEntry = logs[key];
+    const entry = redaction === undefined ? rawEntry : redactReplayEntry(rawEntry, redaction);
+    if (entry !== rawEntry)
+      Object.defineProperty(logs, key, {
+        value: entry,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     const isLegacy = typeof entry === 'string'; // body-only entry: replay with default metadata
     const body = isLegacy ? entry : entry.body;
     const status = isLegacy ? 200 : entry.status;
@@ -796,7 +1228,16 @@ export function replayable(
   wrapped.logs = logs;
   wrapped.accessed = accessed;
   wrapped.export = () =>
-    JSON.stringify(Object.fromEntries(Object.entries(logs).filter(([k, _]) => accessed.has(k))));
+    JSON.stringify(
+      Object.fromEntries(
+        Object.entries(logs)
+          .filter(([key]) => accessed.has(key))
+          .map(([key, entry]) => [
+            key,
+            redaction === undefined ? entry : redactReplayEntry(entry, redaction),
+          ])
+      )
+    );
   return wrapped;
 }
 
@@ -881,6 +1322,10 @@ export function retry(fetchFunction: FetchFn, opts: RetryOpts = {}): FetchFn {
     throw new Error(`expected attempts >= 1, got ${attempts}`);
   const baseDelay = opts.baseDelay === undefined ? 100 : opts.baseDelay;
   const maxDelay = opts.maxDelay === undefined ? 5000 : opts.maxDelay;
+  if (!Number.isFinite(baseDelay) || baseDelay < 0)
+    throw new Error(`expected baseDelay to be a finite non-negative number, got ${baseDelay}`);
+  if (!Number.isFinite(maxDelay) || maxDelay < 0)
+    throw new Error(`expected maxDelay to be a finite non-negative number, got ${maxDelay}`);
   const shouldRetry = opts.shouldRetry || defaultShouldRetry;
   if (typeof shouldRetry !== 'function') throw new Error('opts.shouldRetry must be a function');
   return async (url, reqOpts = {}) => {

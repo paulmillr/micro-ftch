@@ -411,18 +411,26 @@ describe('Network', () => {
     const log = [];
     const f1_l = mftch.ftch(fetch, {
       concurrencyLimit: 1,
-      log: (url, opts) => log.push({ url, opts }),
+      log: (url, opts) =>
+        log.push({
+          url,
+          method: opts.method,
+          headers: Object.fromEntries(new Headers(opts.headers)),
+          body: opts.body,
+          referrerPolicy: opts.referrerPolicy,
+          hasSignal: opts.signal instanceof AbortSignal,
+        }),
     });
     deepStrictEqual(await t(f1_l, { res: 1, sleep: 10 }), { res: 1 });
     deepStrictEqual(serverLog, [1]);
     deepStrictEqual(log, [
       {
         url: 'http://127.0.0.1:8001/',
-        opts: {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: '{"res":1,"sleep":10}',
-        },
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"res":1,"sleep":10}',
+        referrerPolicy: 'no-referrer',
+        hasSignal: true,
       },
     ]);
 
@@ -688,7 +696,10 @@ describe('Network', () => {
       };
     };
     const cases = [
-      { capture: new Headers({ 'Content-Type': 'x' }), replay: new Headers({ 'content-type': 'x' }) },
+      {
+        capture: new Headers({ 'Content-Type': 'x' }),
+        replay: new Headers({ 'content-type': 'x' }),
+      },
       { capture: [['Content-Type', 'x']], replay: [['content-type', 'x']] },
       { capture: { 'Content-Type': 'x' }, replay: { 'content-type': 'x' } },
     ];
@@ -772,23 +783,673 @@ describe('Wrappers v1.1', () => {
     deepStrictEqual(calls, []);
     let ksCalls = 0;
     const f2 = mftch.ftch(fetchFn, {
-      allowedHosts: ['Example.com', 'localhost:8080'],
+      allowedHosts: ['Example.com', 'http://localhost:8080'],
       isValidRequest: () => {
         ksCalls++;
         return true;
       },
     });
-    await f2('https://example.com/x'); // hostname entry, case-insensitive
-    deepStrictEqual(ksCalls, 2); // killswitch runs before and after the fetch
-    await f2('http://localhost:8080/'); // host:port entry
+    await f2('https://example.com/x'); // bare hostname means HTTPS on port 443
+    deepStrictEqual(ksCalls, 3); // before fetch, after headers, and after buffered body
+    await f2('https://example.com:443/'); // explicit default port is the same origin
+    await f2('http://localhost:8080/'); // explicit scheme + port
     await rejects(() => f2('http://localhost:9999/'), /host not allowed/);
+    await rejects(() => f2('http://example.com/'), /host not allowed/);
+    await rejects(() => f2('https://example.com:8443/'), /host not allowed/);
     await rejects(() => f2('/relative'), /relative URL/);
+    const exactOrigins = mftch.ftch(fetchFn, {
+      allowedHosts: ['example.com:8443', 'http://example.com', 'http://example.com:8080'],
+    });
+    await exactOrigins('https://example.com:8443/');
+    await exactOrigins('http://example.com/');
+    await exactOrigins('http://example.com:8080/');
+    await rejects(() => exactOrigins('https://example.com/'), /host not allowed/);
+    await rejects(() => exactOrigins('http://example.com:8443/'), /host not allowed/);
     // Redirect landing on a different host is rejected after the fetch
-    const fRedir = mftch.ftch(async (url) => fakeRes({ url: 'https://evil.com/landed', body: 'x' }), {
+    const fRedir = mftch.ftch(
+      async (url) => fakeRes({ url: 'https://evil.com/landed', body: 'x' }),
+      {
+        allowedHosts: ['example.com'],
+        // Callers on their own redirect mode only get the after-the-fact check.
+      }
+    );
+    await rejects(() => fRedir('https://example.com/', { redirect: 'manual' }), /host not allowed/);
+    throws(() => mftch.ftch(fetchFn, { allowedHosts: 'example.com' as any }));
+  });
+  it('allowedHosts canonicalizes IP spellings and documents the DNS boundary', async () => {
+    const sent = [];
+    const fetchFn = async (url) => {
+      sent.push(url);
+      return fakeRes({ url, body: 'ok' });
+    };
+    const loopback = mftch.ftch(fetchFn, { allowedHosts: ['127.0.0.1', '[::1]'] });
+    for (const url of [
+      'https://127.1/',
+      'https://0177.0.0.1/',
+      'https://0x7f000001/',
+      'https://2130706433/',
+      'https://[0:0:0:0:0:0:0:1]/',
+    ])
+      await loopback(url);
+    deepStrictEqual(sent.length, 5);
+    const publicOnly = mftch.ftch(fetchFn, { allowedHosts: ['example.com'] });
+    for (const url of ['https://127.1/', 'https://0x7f000001/', 'https://2130706433/'])
+      await rejects(() => publicOnly(url), /host not allowed/);
+    deepStrictEqual(sent.length, 5);
+
+    // URL-origin policy deliberately does not resolve DNS. Network-level controls must handle
+    // a permitted name resolving publicly and later rebinding to a private address.
+    const simulatedResolutions = ['203.0.113.10', '127.0.0.1'];
+    const resolved = [];
+    const dnsBoundary = mftch.ftch(
+      async (url) => {
+        resolved.push(simulatedResolutions.shift());
+        return fakeRes({ url, body: 'ok' });
+      },
+      { allowedHosts: ['example.com'] }
+    );
+    await dnsBoundary('https://example.com/one');
+    await dnsBoundary('https://example.com/two');
+    deepStrictEqual(resolved, ['203.0.113.10', '127.0.0.1']);
+  });
+  it('allowedHosts follows redirects itself, checking before each hop', async () => {
+    // With an allowlist, the wrapper forces redirect:'manual' and walks hops
+    // itself: a redirect to a disallowed host dies BEFORE its request is sent,
+    // so the fetch function never even sees the disallowed URL.
+    const sent: string[] = [];
+    const bouncer = (routes: Record<string, string>) => async (url: string, opts: any) => {
+      sent.push(url);
+      deepStrictEqual(opts.redirect, 'manual');
+      const loc = routes[url];
+      return loc
+        ? fakeRes({ url, status: 302, headers: { location: loc } })
+        : fakeRes({ url, body: 'ok' });
+    };
+    const blocked = mftch.ftch(bouncer({ 'https://example.com/': 'https://evil.com/steal' }), {
       allowedHosts: ['example.com'],
     });
-    await rejects(() => fRedir('https://example.com/'), /host not allowed/);
-    throws(() => mftch.ftch(fetchFn, { allowedHosts: 'example.com' as any }));
+    await rejects(() => blocked('https://example.com/'), /host not allowed: evil\.com/);
+    deepStrictEqual(sent, ['https://example.com/']); // evil.com never contacted
+    // Allowed hops follow through, relative locations included, and the final
+    // response reports redirected + the landing URL like fetch's own follow.
+    sent.length = 0;
+    const ok = mftch.ftch(
+      bouncer({
+        'https://example.com/': '/moved',
+        'https://example.com/moved': 'https://also.example.com/x',
+      }),
+      { allowedHosts: ['example.com', 'also.example.com'] }
+    );
+    const res = await ok('https://example.com/');
+    deepStrictEqual(sent, [
+      'https://example.com/',
+      'https://example.com/moved',
+      'https://also.example.com/x',
+    ]);
+    deepStrictEqual(res.redirected, true);
+    deepStrictEqual(res.url, 'https://also.example.com/x');
+    deepStrictEqual(await res.text(), 'ok');
+    // Authorization never leaks across origins on a hop.
+    const auth: (string | null)[] = [];
+    const authFetch = async (url: string, opts: any) => {
+      auth.push(opts.headers.get('Authorization'));
+      return url === 'https://example.com/'
+        ? fakeRes({ url, status: 302, headers: { location: 'https://also.example.com/' } })
+        : fakeRes({ url, body: 'ok' });
+    };
+    const crossed = mftch.ftch(authFetch, {
+      allowedHosts: ['example.com', 'also.example.com'],
+    });
+    await crossed('https://user:pw@example.com/');
+    deepStrictEqual(auth[0]?.startsWith('Basic '), true);
+    deepStrictEqual(auth[1], null);
+    // Redirect loops die at the 20-hop cap instead of spinning.
+    const loop = mftch.ftch(bouncer({ 'https://example.com/': 'https://example.com/' }), {
+      allowedHosts: ['example.com'],
+    });
+    await rejects(() => loop('https://example.com/'), /too many redirects/);
+  });
+  it('allowedHosts redirect hardening', async () => {
+    const sent = [];
+    const bouncer = (routes) => async (url) => {
+      sent.push(url);
+      const loc = routes[url];
+      return loc
+        ? fakeRes({ url, status: 302, headers: { location: loc } })
+        : fakeRes({ url, body: 'ok' });
+    };
+    // isValidRequest is consulted for every hop URL, not only the first request:
+    // a redirect inside the allowlist must not smuggle past URL-based hook logic.
+    const hookSeen = [];
+    const hooked = mftch.ftch(bouncer({ 'https://example.com/': 'https://example.com/blocked' }), {
+      allowedHosts: ['example.com'],
+      isValidRequest: (url) => {
+        hookSeen.push(url);
+        return !(url && url.includes('/blocked'));
+      },
+    });
+    await rejects(() => hooked('https://example.com/'), /network disabled/);
+    deepStrictEqual(sent, ['https://example.com/']); // the blocked hop is never sent
+    deepStrictEqual(hookSeen.includes('https://example.com/blocked'), true);
+    // Redirects only follow http(s): a Location with another scheme dies pre-send,
+    // even when its hostname matches the allowlist.
+    sent.length = 0;
+    const schemed = mftch.ftch(bouncer({ 'https://example.com/': 'ftp://example.com/x' }), {
+      allowedHosts: ['example.com'],
+    });
+    await rejects(() => schemed('https://example.com/'), /scheme not allowed/);
+    deepStrictEqual(sent, ['https://example.com/']);
+    // Same for the initial URL: an allowlist entry means web endpoints only.
+    sent.length = 0;
+    const init = mftch.ftch(bouncer({}), { allowedHosts: ['example.com'] });
+    await rejects(() => init('file://example.com/etc/hosts'), /scheme not allowed/);
+    deepStrictEqual(sent, []);
+    // Credentials, common API-key headers, and configured sensitive headers never
+    // ride a cross-origin hop, but survive same-origin hops.
+    const credRoutes = {
+      'https://example.com/': '/next',
+      'https://example.com/next': 'https://also.example.com/',
+    };
+    const seen = [];
+    const credFetch = async (url, opts) => {
+      seen.push({
+        url,
+        auth: opts.headers.get('authorization'),
+        cookie: opts.headers.get('cookie'),
+        pauth: opts.headers.get('proxy-authorization'),
+        apiKey: opts.headers.get('x-api-key'),
+        custom: opts.headers.get('x-project-secret'),
+      });
+      const loc = credRoutes[url];
+      return loc
+        ? fakeRes({ url, status: 302, headers: { location: loc } })
+        : fakeRes({ url, body: 'ok' });
+    };
+    const cf = mftch.ftch(credFetch, {
+      allowedHosts: ['example.com', 'also.example.com'],
+      sensitiveHeaders: ['X-Project-Secret'],
+    });
+    await cf('https://example.com/', {
+      headers: {
+        Authorization: 'Bearer token',
+        Cookie: 'a=1',
+        'Proxy-Authorization': 'Basic x',
+        'X-Api-Key': 'api-key',
+        'X-Project-Secret': 'custom-secret',
+      },
+    });
+    deepStrictEqual(seen, [
+      {
+        url: 'https://example.com/',
+        auth: 'Bearer token',
+        cookie: 'a=1',
+        pauth: 'Basic x',
+        apiKey: 'api-key',
+        custom: 'custom-secret',
+      },
+      {
+        url: 'https://example.com/next',
+        auth: 'Bearer token',
+        cookie: 'a=1',
+        pauth: 'Basic x',
+        apiKey: 'api-key',
+        custom: 'custom-secret',
+      }, // same-origin: kept
+      {
+        url: 'https://also.example.com/',
+        auth: null,
+        cookie: null,
+        pauth: null,
+        apiKey: null,
+        custom: null,
+      }, // cross-origin: stripped
+    ]);
+  });
+  it('request policy regressions', async () => {
+    let calls = 0;
+    let fetchedUrl;
+    const fetchFn = async (url) => {
+      calls++;
+      fetchedUrl = url;
+      return fakeRes({ url, body: 'ok' });
+    };
+    // Async policy decisions must be awaited, not treated as truthy Promise objects.
+    const asyncBlocked = mftch.ftch(fetchFn, { isValidRequest: async () => false });
+    await rejects(() => asyncBlocked('https://example.com/'), /network disabled/);
+    deepStrictEqual(calls, 0);
+
+    // Runtime JS callers cannot supply an object that stringifies differently for validation/fetch.
+    let conversions = 0;
+    const changingUrl = {
+      [Symbol.toPrimitive]() {
+        return ++conversions === 1 ? 'https://example.com/allowed' : 'https://evil.example/leaked';
+      },
+    };
+    const allowlisted = mftch.ftch(fetchFn, { allowedHosts: ['example.com'] });
+    await (allowlisted as any)(changingUrl);
+    deepStrictEqual(calls, 1);
+    deepStrictEqual(conversions, 1);
+    deepStrictEqual(fetchedUrl, 'https://example.com/allowed');
+
+    // The post-request policy check uses the landing URL, not the original redirect URL.
+    const sent = [];
+    let landingAllowed = true;
+    const redirected = mftch.ftch(
+      async (url) => {
+        sent.push(url);
+        if (url === 'https://example.com/')
+          return fakeRes({ url, status: 302, headers: { location: '/landing' } });
+        landingAllowed = false;
+        return fakeRes({ url, body: 'secret' });
+      },
+      {
+        allowedHosts: ['example.com'],
+        isValidRequest: (url) => !url?.endsWith('/landing') || landingAllowed,
+      }
+    );
+    await rejects(() => redirected('https://example.com/'), /network disabled/);
+    deepStrictEqual(sent, ['https://example.com/', 'https://example.com/landing']);
+
+    // Revocation while a body is being buffered prevents that response reaching the caller.
+    let enabled = true;
+    const encoder = new TextEncoder();
+    const streamed = mftch.ftch(
+      async (url) => ({
+        ...fakeRes({ url }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode('first'));
+            setTimeout(() => {
+              enabled = false;
+              controller.enqueue(encoder.encode('second'));
+              controller.close();
+            }, 0);
+          },
+        }),
+      }),
+      { isValidRequest: () => enabled }
+    );
+    await rejects(() => streamed('https://example.com/'), /network disabled/);
+
+    // Early validation failures still remove the caller abort listener and timeout.
+    let listeners = 0;
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      addEventListener(type) {
+        if (type === 'abort') listeners++;
+      },
+      removeEventListener(type) {
+        if (type === 'abort') listeners--;
+      },
+    };
+    const earlyBlocked = mftch.ftch(fetchFn, {
+      allowedHosts: ['example.com'],
+      timeout: 60_000,
+    });
+    await rejects(
+      () => earlyBlocked('https://evil.example/', { signal: signal as any }),
+      /host not allowed/
+    );
+    deepStrictEqual(listeners, 0);
+  });
+  it('killswitchSignal aborts active requests and blocks queued/future requests', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const pendingFetch = async (_url, opts) => {
+      calls++;
+      return new Promise((_, reject) => {
+        if (opts.signal.aborted) return reject(opts.signal.reason);
+        opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true });
+      });
+    };
+    const net = mftch.ftch(pendingFetch, {
+      concurrencyLimit: 1,
+      killswitchSignal: controller.signal,
+    });
+    const active = net('https://example.com/active');
+    const queued = net('https://example.com/queued');
+    await sleep(0);
+    const reason = new Error('emergency stop');
+    controller.abort(reason);
+    const settled = await Promise.allSettled([active, queued]);
+    deepStrictEqual(
+      settled.map((result) => result.status),
+      ['rejected', 'rejected']
+    );
+    deepStrictEqual((settled[0] as PromiseRejectedResult).reason, reason);
+    deepStrictEqual((settled[1] as PromiseRejectedResult).reason.message, 'network disabled');
+    deepStrictEqual(calls, 1); // queued request never reaches the transport
+    await rejects(() => net('https://example.com/future'), /network disabled/);
+    deepStrictEqual(calls, 1);
+
+    // The wrapper also cancels a pending custom response stream that does not observe fetch's
+    // signal itself, so body buffering cannot delay the killswitch.
+    const streamController = new AbortController();
+    let streamCancelled = false;
+    const streaming = mftch.ftch(
+      async (url) => ({
+        ...fakeRes({ url }),
+        body: new ReadableStream({
+          cancel() {
+            streamCancelled = true;
+          },
+        }),
+      }),
+      { killswitchSignal: streamController.signal }
+    );
+    const reading = streaming('https://example.com/stream');
+    await sleep(0);
+    const streamReason = new Error('stop stream');
+    streamController.abort(streamReason);
+    await rejects(reading, { message: 'stop stream' });
+    deepStrictEqual(streamCancelled, true);
+
+    // Successful requests remove the shared-signal listener.
+    let listeners = 0;
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      addEventListener(type) {
+        if (type === 'abort') listeners++;
+      },
+      removeEventListener(type) {
+        if (type === 'abort') listeners--;
+      },
+    };
+    await mftch.ftch(async (url) => fakeRes({ url, body: 'ok' }), {
+      killswitchSignal: signal as any,
+    })('https://example.com/');
+    deepStrictEqual(listeners, 0);
+  });
+  it('redirect response validation and logging', async () => {
+    const wrongScheme = mftch.ftch(
+      async () => fakeRes({ url: 'file://example.com/etc/passwd', body: 'x' }),
+      { allowedHosts: ['example.com'] }
+    );
+    await rejects(() => wrongScheme('https://example.com/'), /scheme not allowed/);
+    const malformed = mftch.ftch(async () => fakeRes({ url: 'not a URL', body: 'x' }), {
+      allowedHosts: ['example.com'],
+    });
+    await rejects(() => malformed('https://example.com/'), /cannot verify host of response URL/);
+
+    // 304 is not a redirect status, even if a non-conforming response includes Location.
+    const notModifiedCalls = [];
+    const notModified = mftch.ftch(
+      async (url) => {
+        notModifiedCalls.push(url);
+        return fakeRes({ url, status: 304, headers: { location: '/must-not-follow' } });
+      },
+      { allowedHosts: ['example.com'] }
+    );
+    deepStrictEqual((await notModified('https://example.com/')).status, 304);
+    deepStrictEqual(notModifiedCalls, ['https://example.com/']);
+
+    // Logs reflect per-hop method/body/header rewriting, but are isolated from logger mutation.
+    const sent = [];
+    const logged = [];
+    const followed = mftch.ftch(
+      async (url, opts) => {
+        sent.push({
+          url,
+          method: opts.method,
+          body: opts.body,
+          auth: opts.headers.get('authorization'),
+          contentType: opts.headers.get('content-type'),
+        });
+        return sent.length === 1
+          ? fakeRes({ url, status: 302, headers: { location: '/next' } })
+          : fakeRes({ url, body: 'ok' });
+      },
+      {
+        allowedHosts: ['example.com'],
+        log: (url, opts) => {
+          const headers = opts.headers as Headers;
+          logged.push({
+            url,
+            method: opts.method,
+            body: opts.body,
+            contentType: headers.get('content-type'),
+          });
+          opts.method = 'DELETE';
+          headers.set('authorization', 'mutated');
+        },
+      }
+    );
+    await followed('https://example.com/', {
+      method: 'POST',
+      body: 'payload',
+      headers: { Authorization: 'Bearer real', 'Content-Type': 'text/plain' },
+    });
+    deepStrictEqual(sent, [
+      {
+        url: 'https://example.com/',
+        method: 'POST',
+        body: 'payload',
+        auth: 'Bearer real',
+        contentType: 'text/plain',
+      },
+      {
+        url: 'https://example.com/next',
+        method: 'GET',
+        body: undefined,
+        auth: 'Bearer real',
+        contentType: null,
+      },
+    ]);
+    deepStrictEqual(logged, [
+      {
+        url: 'https://example.com/',
+        method: 'POST',
+        body: 'payload',
+        contentType: 'text/plain',
+      },
+      {
+        url: 'https://example.com/next',
+        method: 'GET',
+        body: undefined,
+        contentType: null,
+      },
+    ]);
+  });
+  it('rejects HTTPS redirect downgrades by default', async () => {
+    const sent = [];
+    const bouncer = async (url) => {
+      sent.push(url);
+      return url === 'https://example.com/'
+        ? fakeRes({ url, status: 302, headers: { location: 'http://example.com/landing' } })
+        : fakeRes({ url, body: 'ok' });
+    };
+    // Downgrades are rejected before the HTTP request, even without an allowlist.
+    const blocked = mftch.ftch(bouncer);
+    await rejects(() => blocked('https://example.com/'), /HTTPS to HTTP downgrade not allowed/);
+    deepStrictEqual(sent, ['https://example.com/']);
+    sent.length = 0;
+    const listedButNotOptedIn = mftch.ftch(bouncer, {
+      allowedHosts: ['example.com', 'http://example.com'],
+    });
+    await rejects(
+      () => listedButNotOptedIn('https://example.com/'),
+      /HTTPS to HTTP downgrade not allowed/
+    );
+    deepStrictEqual(sent, ['https://example.com/']);
+
+    // The same policy applies when the downgrade appears later in a redirect chain.
+    const chainSent = [];
+    const chain = mftch.ftch(
+      async (url) => {
+        chainSent.push(url);
+        if (url === 'https://example.com/')
+          return fakeRes({ url, status: 302, headers: { location: 'https://also.example.com/' } });
+        return fakeRes({
+          url,
+          status: 307,
+          headers: { location: 'http://also.example.com/private' },
+        });
+      },
+      {
+        allowedHosts: ['example.com', 'also.example.com', 'http://also.example.com'],
+      }
+    );
+    await rejects(() => chain('https://example.com/'), /HTTPS to HTTP downgrade not allowed/);
+    deepStrictEqual(chainSent, ['https://example.com/', 'https://also.example.com/']);
+
+    // Opt-in permits the downgrade when no allowlist is configured.
+    sent.length = 0;
+    const optedIn = mftch.ftch(bouncer, { allowInsecureRedirects: true });
+    deepStrictEqual(await (await optedIn('https://example.com/')).text(), 'ok');
+    deepStrictEqual(sent, ['https://example.com/', 'http://example.com/landing']);
+
+    // With an allowlist, opting in still requires the exact HTTP landing origin.
+    sent.length = 0;
+    const allowlisted = mftch.ftch(bouncer, {
+      allowedHosts: ['example.com', 'http://example.com'],
+      allowInsecureRedirects: true,
+    });
+    await allowlisted('https://example.com/');
+    deepStrictEqual(sent, ['https://example.com/', 'http://example.com/landing']);
+    sent.length = 0;
+    const missingHttpOrigin = mftch.ftch(bouncer, {
+      allowedHosts: ['example.com'],
+      allowInsecureRedirects: true,
+    });
+    await rejects(() => missingHttpOrigin('https://example.com/'), /host not allowed/);
+    deepStrictEqual(sent, ['https://example.com/']);
+  });
+  it('configuration option validation', async () => {
+    const fetchFn = async (url) => fakeRes({ url, body: 'ok' });
+    throws(() => mftch.ftch(fetchFn, { isValidRequest: false as any }));
+    throws(() => mftch.ftch(fetchFn, { killswitch: false as any }));
+    throws(() => mftch.ftch(fetchFn, { killswitchSignal: {} as any }));
+    throws(() => mftch.ftch(fetchFn, { sensitiveHeaders: 'x-secret' as any }));
+    throws(() => mftch.ftch(fetchFn, { sensitiveHeaders: ['bad header'] }));
+    throws(() => mftch.ftch(fetchFn, { allowInsecureRedirects: 'yes' as any }));
+    throws(() => mftch.ftch(fetchFn, { allowedHosts: ['ftp://example.com'] }));
+    throws(() => mftch.ftch(fetchFn, { allowedHosts: ['https://example.com/path'] }));
+    throws(() => mftch.ftch(fetchFn, { allowedHosts: ['//example.com'] }));
+    throws(() => mftch.ftch(fetchFn, { concurrencyLimit: NaN }));
+    throws(() => mftch.ftch(fetchFn, { concurrencyLimit: 1.5 }));
+    throws(() => mftch.ftch(fetchFn, { timeout: Infinity }));
+    await rejects(
+      () => mftch.ftch(fetchFn)('https://example.com/', { timeout: Infinity }),
+      /finite non-negative/
+    );
+    throws(() => mftch.jsonrpc(fetchFn, 'https://example.com/', { batchSize: 0 }));
+    throws(() => mftch.jsonrpc(fetchFn, 'https://example.com/', { batchSize: 1.5 }));
+    throws(() => mftch.retry(fetchFn, { baseDelay: Infinity }));
+    throws(() => mftch.retry(fetchFn, { maxDelay: -1 }));
+    throws(() => mftch.replayable(fetchFn, {}, { redact: true as any }));
+    throws(() => mftch.replayable(fetchFn, {}, { redact: { headers: 'x-secret' as any } }));
+    throws(() => mftch.replayable(fetchFn, {}, { redact: { fields: [1] as any } }));
+    throws(() => mftch.replayable(fetchFn, {}, { redact: { replacement: 1 as any } }));
+  });
+  it('replayable hostile getKey keys', async () => {
+    const fetchFn = async (url) => fakeRes({ url, body: 'live' });
+    // Keys landing on Object.prototype names must become own properties:
+    // `logs['__proto__'] = entry` would silently swap the log's prototype instead
+    // of storing the capture.
+    const proto = mftch.replayable(fetchFn, {}, { getKey: () => '__proto__' });
+    deepStrictEqual(await (await proto('https://example.com/')).text(), 'live');
+    deepStrictEqual(Object.hasOwn(proto.logs, '__proto__'), true);
+    deepStrictEqual(JSON.parse(proto.export())['__proto__'].body, 'live');
+    // Inherited names are misses, not replays of Object.prototype members.
+    const offline = mftch.replayable(fetchFn, {}, { offline: true, getKey: () => 'toString' });
+    await rejects(() => offline('https://example.com/'), /unknown request/);
+  });
+  it('replayable redacts secrets without collapsing request identities', async () => {
+    const responseBody = JSON.stringify({
+      token: 'response-token',
+      nested: { mnemonic: 'response-mnemonic', public: 'ok' },
+    });
+    let calls = 0;
+    const fetchFn = async (url, opts) => {
+      calls++;
+      // The transport still receives the original request; only replay material is sanitized.
+      deepStrictEqual(url.includes('query-secret'), true);
+      deepStrictEqual(
+        new Headers(opts.headers).get('authorization')?.includes('auth-secret'),
+        true
+      );
+      deepStrictEqual(String(opts.body).includes('request-password'), true);
+      return fakeRes({
+        url,
+        headers: {
+          'Set-Cookie': 'session=response-cookie; Secure',
+          'X-Api-Key': 'response-api-key',
+          'X-Project-Secret': 'response-project-secret',
+          'X-Safe': 'visible',
+        },
+        body: responseBody,
+      });
+    };
+    const opts = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer auth-secret',
+        Cookie: 'session=request-cookie',
+        'X-Api-Key': 'request-api-key',
+        'X-Project-Secret': 'request-project-secret',
+      },
+      body: JSON.stringify({ password: 'request-password', nested: { mnemonic: 'seed words' } }),
+    };
+    const url =
+      'https://user:url-password@example.com/private?api_key=query-secret&visible=yes#fragment-secret';
+    const live = mftch.replayable(
+      fetchFn,
+      {},
+      {
+        redact: { headers: ['X-Project-Secret'], fields: ['mnemonic'] },
+      }
+    );
+    deepStrictEqual(await (await live(url, opts)).json(), JSON.parse(responseBody));
+    const exported = live.export();
+    for (const secret of [
+      'auth-secret',
+      'request-cookie',
+      'request-api-key',
+      'request-project-secret',
+      'request-password',
+      'seed words',
+      'url-password',
+      'query-secret',
+      'fragment-secret',
+      'response-cookie',
+      'response-api-key',
+      'response-project-secret',
+      'response-token',
+      'response-mnemonic',
+    ])
+      deepStrictEqual(exported.includes(secret), false, `export leaked ${secret}`);
+    deepStrictEqual(exported.includes('sha256'), true);
+    const parsed = JSON.parse(exported);
+    const [key] = Object.keys(parsed);
+    deepStrictEqual(parsed[key].headers, {
+      'set-cookie': '[REDACTED]',
+      'x-api-key': '[REDACTED]',
+      'x-project-secret': '[REDACTED]',
+      'x-safe': 'visible',
+    });
+    deepStrictEqual(JSON.parse(parsed[key].body), {
+      token: '[REDACTED]',
+      nested: { mnemonic: '[REDACTED]', public: 'ok' },
+    });
+
+    // Hashed key material distinguishes credentials without exposing them.
+    await live(url, {
+      ...opts,
+      headers: { ...opts.headers, Authorization: 'Bearer another-auth-secret' },
+    });
+    deepStrictEqual(calls, 2);
+
+    const offline = mftch.replayable(fetchFn, parsed, {
+      offline: true,
+      redact: { headers: ['X-Project-Secret'], fields: ['mnemonic'] },
+    });
+    deepStrictEqual(await (await offline(url, opts)).json(), {
+      token: '[REDACTED]',
+      nested: { mnemonic: '[REDACTED]', public: 'ok' },
+    });
   });
   it('maxBodySize', async () => {
     const body = 'a'.repeat(100);
@@ -799,7 +1460,10 @@ describe('Wrappers v1.1', () => {
       /maxBodySize/
     );
     // Fallback (no stream): actual length checked after reading
-    await rejects(() => mftch.ftch(mkFetch({}), { maxBodySize: 10 })('https://x.com/'), /maxBodySize/);
+    await rejects(
+      () => mftch.ftch(mkFetch({}), { maxBodySize: 10 })('https://x.com/'),
+      /maxBodySize/
+    );
     deepStrictEqual(
       await (await mftch.ftch(mkFetch({}), { maxBodySize: 100 })('https://x.com/')).text(),
       body
@@ -816,10 +1480,14 @@ describe('Wrappers v1.1', () => {
     });
     await rejects(
       () =>
-        mftch.ftch(async () => streamRes(['aaaa', 'bbbb', 'cccc']), { maxBodySize: 10 })('https://x.com/'),
+        mftch.ftch(async () => streamRes(['aaaa', 'bbbb', 'cccc']), { maxBodySize: 10 })(
+          'https://x.com/'
+        ),
       /maxBodySize/
     );
-    const ok = await mftch.ftch(async () => streamRes(['aaaa', 'bbbb']), { maxBodySize: 10 })('https://x.com/');
+    const ok = await mftch.ftch(async () => streamRes(['aaaa', 'bbbb']), { maxBodySize: 10 })(
+      'https://x.com/'
+    );
     deepStrictEqual(await ok.text(), 'aaaabbbb');
     throws(() => mftch.ftch(mkFetch({}), { maxBodySize: 0 }));
   });
@@ -841,7 +1509,13 @@ describe('Wrappers v1.1', () => {
   });
   it('replayable response metadata', async () => {
     const fetchFn = async (url) =>
-      fakeRes({ url, status: 404, statusText: 'Not Found', headers: { 'x-a': '1' }, body: 'missing' });
+      fakeRes({
+        url,
+        status: 404,
+        statusText: 'Not Found',
+        headers: { 'x-a': '1' },
+        body: 'missing',
+      });
     const live = mftch.replayable(fetchFn);
     const r1 = await live('https://example.com/404');
     deepStrictEqual([r1.status, r1.ok], [404, false]);
