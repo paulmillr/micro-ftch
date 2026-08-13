@@ -68,7 +68,9 @@ Basic wrapper over `fetch()`.
 ### isValidRequest
 
 When isValidRequest killswitch is enabled, all requests will throw an error.
-You can dynamically enable and disable it any any time.
+You can dynamically enable and disable it at any time. The callback may return a
+boolean or a `Promise<boolean>`; it is checked before a request, after response
+headers, and after the response body has been buffered.
 
 ```ts
 import { ftch } from 'micro-ftch';
@@ -82,22 +84,63 @@ ENABLED = true;
 f('http://localhost'); // ok
 ```
 
-### allowedHosts
-
-Declarative host allowlist, harder to get wrong than a hand-written URL predicate.
-Checked before `isValidRequest`, re-checked on the final (post-redirect) URL,
-and rejects relative URLs whose host cannot be verified.
-Entries match `URL.hostname` (`example.com`, any port) or `URL.host` (`example.com:8443`, exact port).
+For immediate cancellation of active requests, use the one-shot signal killswitch. It also
+blocks queued and future requests made through that wrapper; construct a new wrapper to re-enable
+network access.
 
 ```ts
 import { ftch } from 'micro-ftch';
 
-const f = ftch(fetch, { allowedHosts: ['rpc.example.com', 'localhost:8545'] });
+const network = new AbortController();
+const f = ftch(fetch, { killswitchSignal: network.signal });
+const pending = f('https://example.com/slow');
+network.abort(new Error('network disabled')); // aborts pending immediately
+```
+
+### allowedHosts
+
+Declarative origin allowlist, kept under the `allowedHosts` option name for compatibility.
+It is checked before `isValidRequest` and rejects relative URLs whose origin cannot be verified.
+A bare hostname such as `example.com` means exactly `https://example.com:443`. A port means an
+alternate HTTPS origin, such as `example.com:8443`. HTTP must be explicit, for example
+`http://example.com` or `http://localhost:8080`. Paths, queries, credentials, and fragments are
+not valid entries.
+
+Absolute HTTP(S) redirects are followed by the wrapper itself, one hop at a time. This
+lets every hop's downgrade policy and `isValidRequest` verdict—and, when configured,
+its allowlisted origin—be checked _before_ its request is sent. Hops are capped at 20;
+credentials, cookies, and common API-key headers do not survive cross-origin hops. Add custom
+secret header names with `sensitiveHeaders`. Callers that pass `redirect: 'manual'`/`'error'`
+keep their own semantics and get only an after-the-fact check of the response URL.
+
+HTTPS-to-HTTP redirects are rejected before the HTTP request is sent, including when no
+allowlist is configured. If a trusted endpoint genuinely requires a downgrade, opt in with
+`allowInsecureRedirects: true`; when using `allowedHosts`, the exact HTTP landing origin must
+also be listed.
+
+```ts
+import { ftch } from 'micro-ftch';
+
+const f = ftch(fetch, {
+  allowedHosts: ['rpc.example.com', 'rpc.example.com:8443', 'http://localhost:8545'],
+  sensitiveHeaders: ['X-Project-Secret'],
+});
 f('https://rpc.example.com/'); // ok
+f('https://rpc.example.com:8443/'); // ok
+f('http://localhost:8545/'); // ok: HTTP was explicit
 f('https://evil.com/'); // throws
 ```
 
+`allowedHosts` is not a complete SSRF sandbox. It validates URL origins, but the fetch
+implementation still performs DNS resolution. A permitted hostname can resolve or be rebound
+to loopback, private, link-local, cloud-metadata, or other internal addresses. Enforce trusted
+DNS resolution and network-level egress rules when requests cross a security boundary.
+
 ### log
+
+The callback receives a shallow snapshot of the actual per-hop request options,
+including method and header changes made while following redirects. The `Headers`
+object is cloned so logger mutations do not alter the request.
 
 ```ts
 import { ftch } from 'micro-ftch';
@@ -212,6 +255,9 @@ Captured entries record response metadata (`status`, `statusText`, `headers`) al
 body, so error handling can be replay-tested too. Old body-only log files still replay,
 with default `200 OK` metadata. Binary bodies that don't survive a UTF-8 round-trip are
 stored base64-encoded automatically; text bodies stay readable in exported logs.
+
+Logs capture requests and responses verbatim, including any credentials or secrets they
+contain, so treat exported fixtures as sensitive test artifacts.
 
 ### retry
 
