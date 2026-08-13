@@ -256,31 +256,8 @@ body, so error handling can be replay-tested too. Old body-only log files still 
 with default `200 OK` metadata. Binary bodies that don't survive a UTF-8 round-trip are
 stored base64-encoded automatically; text bodies stay readable in exported logs.
 
-Replay redaction is enabled by default. Plaintext values from `Authorization`, cookies,
-`Set-Cookie`, common API-key headers, URL credentials/fragments, and common secret JSON/query
-fields are never written to new logs. Sensitive request values become SHA-256 fingerprints so
-requests with different credentials retain distinct replay keys; sensitive response values
-become `[REDACTED]`. Add project-specific names recursively with `redact.headers` and
-`redact.fields`:
-
-```ts
-import { ftch as createFtch, replayable } from 'micro-ftch';
-
-const replay = replayable(
-  createFtch(fetch),
-  {},
-  {
-    redact: {
-      headers: ['X-Project-Secret'],
-      fields: ['mnemonic', 'recoveryPhrase'],
-    },
-  }
-);
-```
-
-Pass `redact: false` only when consuming a trusted legacy fixture that requires raw values.
-SHA-256 fingerprints can still reveal low-entropy values by guessing, so fixtures should be
-treated as potentially sensitive test artifacts.
+Logs capture requests and responses verbatim, including any credentials or secrets they
+contain, so treat exported fixtures as sensitive test artifacts.
 
 ### retry
 

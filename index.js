@@ -48,20 +48,6 @@ const DEFAULT_SENSITIVE_HEADERS = [
     'api-key',
     'x-auth-token',
 ];
-const DEFAULT_SENSITIVE_FIELDS = [
-    'password',
-    'passwd',
-    'secret',
-    'token',
-    'access-token',
-    'refresh-token',
-    'api-key',
-    'client-secret',
-    'private-key',
-    'session-id',
-];
-const REDACTED = '[REDACTED]';
-const normalizeSensitiveName = (name) => name.toLowerCase().replace(/[-_]/g, '');
 function validateStringList(value, name) {
     if (value !== undefined && (!Array.isArray(value) || value.some((v) => typeof v !== 'string')))
         throw new Error(`${name} must be an array of strings`);
@@ -730,177 +716,21 @@ function decodeBody(stored) {
         return base64ToBytes(stored.slice(B64_MARK.length));
     return new TextEncoder().encode(stored);
 }
-function createReplayRedaction(redact) {
-    if (redact === false)
-        return;
-    if (redact !== undefined && (redact === null || typeof redact !== 'object'))
-        throw new Error('opts.redact must be false or an object');
-    validateStringList(redact?.headers, 'opts.redact.headers');
-    validateStringList(redact?.fields, 'opts.redact.fields');
-    if (redact?.replacement !== undefined && typeof redact.replacement !== 'string')
-        throw new Error('opts.redact.replacement must be a string');
-    const headers = new Set(DEFAULT_SENSITIVE_HEADERS);
-    for (const name of redact?.headers || []) {
-        const normalized = new Headers([[name, '']]);
-        for (const normalizedName of normalized.keys())
-            headers.add(normalizedName);
-    }
-    const fields = new Set(DEFAULT_SENSITIVE_FIELDS.map(normalizeSensitiveName));
-    for (const name of redact?.fields || [])
-        fields.add(normalizeSensitiveName(name));
-    return { headers, fields, replacement: redact?.replacement ?? REDACTED };
-}
-function redactJsonValue(value, redaction) {
-    if (value === null || typeof value !== 'object')
-        return false;
-    let changed = false;
-    if (Array.isArray(value)) {
-        for (const item of value)
-            changed = redactJsonValue(item, redaction) || changed;
-        return changed;
-    }
-    for (const [key, item] of Object.entries(value)) {
-        if (redaction.fields.has(normalizeSensitiveName(key))) {
-            Object.defineProperty(value, key, {
-                value: redaction.replacement,
-                enumerable: true,
-                writable: true,
-                configurable: true,
-            });
-            changed = true;
-        }
-        else {
-            changed = redactJsonValue(item, redaction) || changed;
-        }
-    }
-    return changed;
-}
-function redactJsonText(text, redaction) {
-    let json;
-    try {
-        json = JSON.parse(text);
-    }
-    catch {
-        return text;
-    }
-    return redactJsonValue(json, redaction) ? JSON.stringify(json) : text;
-}
-async function hashSecret(value) {
-    if (globalThis.crypto?.subtle === undefined)
-        throw new Error('replay redaction requires Web Crypto SHA-256 support');
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
-    const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
-    return `[REDACTED sha256:${hex}]`;
-}
-async function hashJsonValue(value, fields) {
-    if (value === null || typeof value !== 'object')
-        return false;
-    let changed = false;
-    if (Array.isArray(value)) {
-        for (const item of value)
-            changed = (await hashJsonValue(item, fields)) || changed;
-        return changed;
-    }
-    for (const [key, item] of Object.entries(value)) {
-        if (fields.has(normalizeSensitiveName(key))) {
-            const serialized = JSON.stringify(item);
-            Object.defineProperty(value, key, {
-                value: await hashSecret(serialized === undefined ? String(item) : serialized),
-                enumerable: true,
-                writable: true,
-                configurable: true,
-            });
-            changed = true;
-        }
-        else {
-            changed = (await hashJsonValue(item, fields)) || changed;
-        }
-    }
-    return changed;
-}
-async function hashJsonText(text, fields) {
-    let json;
-    try {
-        json = JSON.parse(text);
-    }
-    catch {
-        return text;
-    }
-    return (await hashJsonValue(json, fields)) ? JSON.stringify(json) : text;
-}
-async function redactUrlKey(url, redaction) {
-    let parsed;
-    try {
-        parsed = new URL(url);
-    }
-    catch {
-        return url;
-    }
-    let changed = false;
-    if (parsed.username) {
-        parsed.username = await hashSecret(parsed.username);
-        changed = true;
-    }
-    if (parsed.password) {
-        parsed.password = await hashSecret(parsed.password);
-        changed = true;
-    }
-    if (parsed.hash) {
-        parsed.hash = await hashSecret(parsed.hash.slice(1));
-        changed = true;
-    }
-    const params = new URLSearchParams();
-    for (const [name, value] of parsed.searchParams) {
-        if (redaction.fields.has(normalizeSensitiveName(name))) {
-            params.append(name, await hashSecret(value));
-            changed = true;
-        }
-        else {
-            params.append(name, value);
-        }
-    }
-    if (changed)
-        parsed.search = params.toString();
-    return changed ? parsed.href : url;
-}
-const getKey = async (url, opts, fn = defaultGetKey, redaction) => {
+const getKey = async (url, opts, fn = defaultGetKey) => {
     // RFC 9110 §5.1: field names are case-insensitive, so replay keys need canonicalized header names.
     const headers = {};
     // Headers accepts every HeadersInit shape and normalizes duplicate handling like fetch.
-    for (const [key, value] of new Headers(opts.headers)) {
-        headers[normalizeHeader(key)] =
-            redaction?.headers.has(key) === true ? await hashSecret(value) : value;
-    }
-    const safeUrl = redaction === undefined ? url : await redactUrlKey(url, redaction);
-    const body = redaction !== undefined && typeof opts.body === 'string'
-        ? await hashJsonText(opts.body, redaction.fields)
-        : opts.body;
-    return fn(safeUrl, { method: opts.method, headers, body });
+    for (const [key, value] of new Headers(opts.headers))
+        headers[normalizeHeader(key)] = value;
+    return fn(url, { method: opts.method, headers, body: opts.body });
 };
-function redactReplayEntry(entry, redaction) {
-    if (typeof entry === 'string')
-        return entry.startsWith(B64_MARK) ? entry : redactJsonText(entry, redaction);
-    const headers = {};
-    for (const [key, value] of Object.entries(entry.headers))
-        Object.defineProperty(headers, key, {
-            value: redaction.headers.has(key.toLowerCase()) ? redaction.replacement : value,
-            enumerable: true,
-            writable: true,
-            configurable: true,
-        });
-    return {
-        ...entry,
-        headers,
-        body: entry.body.startsWith(B64_MARK) ? entry.body : redactJsonText(entry.body, redaction),
-    };
-}
 /**
  * Log & replay network requests without actually calling network code.
  * @param fetchFunction - Wrapped fetch implementation used to capture new responses.
  * @param logs - Captured request/response map, usually from `JSON.parse(replay.export())`.
  * @param opts - Replay configuration such as offline mode or custom keying. See {@link ReplayOpts}.
  * @returns Fetch-compatible wrapper with log export helpers.
- * @throws If replay redaction options are invalid or the runtime lacks Web Crypto support. {@link Error}
+ * @throws If replay options are invalid. {@link Error}
  * @example
  * Record live responses once, then export the captured log.
  * ```js
@@ -948,10 +778,9 @@ function redactReplayEntry(entry, redaction) {
  * ```
  */
 export function replayable(fetchFunction, logs = {}, opts = {}) {
-    const redaction = createReplayRedaction(opts.redact);
     const accessed = new Set();
     const wrapped = async (url, reqOpts = {}) => {
-        const key = await getKey(url, reqOpts, opts.getKey, redaction);
+        const key = await getKey(url, reqOpts, opts.getKey);
         accessed.add(key);
         // Empty-string payloads are valid captures; missing entries must be checked by key presence,
         // not truthiness — and by OWN key presence: `in` would match Object.prototype members
@@ -974,7 +803,7 @@ export function replayable(fetchFunction, logs = {}, opts = {}) {
                         const bytes = new Uint8Array(buffer);
                         const headers = {};
                         info.headers.forEach((value, key) => Object.defineProperty(headers, key, {
-                            value: redaction?.headers.has(key) === true ? redaction.replacement : value,
+                            value,
                             enumerable: true,
                             writable: true,
                             configurable: true,
@@ -986,9 +815,7 @@ export function replayable(fetchFunction, logs = {}, opts = {}) {
                                 status: info.status,
                                 statusText: info.statusText,
                                 headers,
-                                body: redaction === undefined
-                                    ? encodeBody(bytes)
-                                    : redactJsonText(encodeBody(bytes), redaction),
+                                body: encodeBody(bytes),
                             },
                             enumerable: true,
                             writable: true,
@@ -1005,15 +832,7 @@ export function replayable(fetchFunction, logs = {}, opts = {}) {
                 arrayBuffer: async () => (await readBody()).buffer,
             };
         }
-        const rawEntry = logs[key];
-        const entry = redaction === undefined ? rawEntry : redactReplayEntry(rawEntry, redaction);
-        if (entry !== rawEntry)
-            Object.defineProperty(logs, key, {
-                value: entry,
-                enumerable: true,
-                writable: true,
-                configurable: true,
-            });
+        const entry = logs[key];
         const isLegacy = typeof entry === 'string'; // body-only entry: replay with default metadata
         const body = isLegacy ? entry : entry.body;
         const status = isLegacy ? 200 : entry.status;
@@ -1032,12 +851,7 @@ export function replayable(fetchFunction, logs = {}, opts = {}) {
     };
     wrapped.logs = logs;
     wrapped.accessed = accessed;
-    wrapped.export = () => JSON.stringify(Object.fromEntries(Object.entries(logs)
-        .filter(([key]) => accessed.has(key))
-        .map(([key, entry]) => [
-        key,
-        redaction === undefined ? entry : redactReplayEntry(entry, redaction),
-    ])));
+    wrapped.export = () => JSON.stringify(Object.fromEntries(Object.entries(logs).filter(([key]) => accessed.has(key))));
     return wrapped;
 }
 const defaultShouldRetry = (ctx) => {

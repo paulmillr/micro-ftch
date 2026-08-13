@@ -1338,10 +1338,6 @@ describe('Wrappers v1.1', () => {
     throws(() => mftch.jsonrpc(fetchFn, 'https://example.com/', { batchSize: 1.5 }));
     throws(() => mftch.retry(fetchFn, { baseDelay: Infinity }));
     throws(() => mftch.retry(fetchFn, { maxDelay: -1 }));
-    throws(() => mftch.replayable(fetchFn, {}, { redact: true as any }));
-    throws(() => mftch.replayable(fetchFn, {}, { redact: { headers: 'x-secret' as any } }));
-    throws(() => mftch.replayable(fetchFn, {}, { redact: { fields: [1] as any } }));
-    throws(() => mftch.replayable(fetchFn, {}, { redact: { replacement: 1 as any } }));
   });
   it('replayable hostile getKey keys', async () => {
     const fetchFn = async (url) => fakeRes({ url, body: 'live' });
@@ -1355,101 +1351,6 @@ describe('Wrappers v1.1', () => {
     // Inherited names are misses, not replays of Object.prototype members.
     const offline = mftch.replayable(fetchFn, {}, { offline: true, getKey: () => 'toString' });
     await rejects(() => offline('https://example.com/'), /unknown request/);
-  });
-  it('replayable redacts secrets without collapsing request identities', async () => {
-    const responseBody = JSON.stringify({
-      token: 'response-token',
-      nested: { mnemonic: 'response-mnemonic', public: 'ok' },
-    });
-    let calls = 0;
-    const fetchFn = async (url, opts) => {
-      calls++;
-      // The transport still receives the original request; only replay material is sanitized.
-      deepStrictEqual(url.includes('query-secret'), true);
-      deepStrictEqual(
-        new Headers(opts.headers).get('authorization')?.includes('auth-secret'),
-        true
-      );
-      deepStrictEqual(String(opts.body).includes('request-password'), true);
-      return fakeRes({
-        url,
-        headers: {
-          'Set-Cookie': 'session=response-cookie; Secure',
-          'X-Api-Key': 'response-api-key',
-          'X-Project-Secret': 'response-project-secret',
-          'X-Safe': 'visible',
-        },
-        body: responseBody,
-      });
-    };
-    const opts = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer auth-secret',
-        Cookie: 'session=request-cookie',
-        'X-Api-Key': 'request-api-key',
-        'X-Project-Secret': 'request-project-secret',
-      },
-      body: JSON.stringify({ password: 'request-password', nested: { mnemonic: 'seed words' } }),
-    };
-    const url =
-      'https://user:url-password@example.com/private?api_key=query-secret&visible=yes#fragment-secret';
-    const live = mftch.replayable(
-      fetchFn,
-      {},
-      {
-        redact: { headers: ['X-Project-Secret'], fields: ['mnemonic'] },
-      }
-    );
-    deepStrictEqual(await (await live(url, opts)).json(), JSON.parse(responseBody));
-    const exported = live.export();
-    for (const secret of [
-      'auth-secret',
-      'request-cookie',
-      'request-api-key',
-      'request-project-secret',
-      'request-password',
-      'seed words',
-      'url-password',
-      'query-secret',
-      'fragment-secret',
-      'response-cookie',
-      'response-api-key',
-      'response-project-secret',
-      'response-token',
-      'response-mnemonic',
-    ])
-      deepStrictEqual(exported.includes(secret), false, `export leaked ${secret}`);
-    deepStrictEqual(exported.includes('sha256'), true);
-    const parsed = JSON.parse(exported);
-    const [key] = Object.keys(parsed);
-    deepStrictEqual(parsed[key].headers, {
-      'set-cookie': '[REDACTED]',
-      'x-api-key': '[REDACTED]',
-      'x-project-secret': '[REDACTED]',
-      'x-safe': 'visible',
-    });
-    deepStrictEqual(JSON.parse(parsed[key].body), {
-      token: '[REDACTED]',
-      nested: { mnemonic: '[REDACTED]', public: 'ok' },
-    });
-
-    // Hashed key material distinguishes credentials without exposing them.
-    await live(url, {
-      ...opts,
-      headers: { ...opts.headers, Authorization: 'Bearer another-auth-secret' },
-    });
-    deepStrictEqual(calls, 2);
-
-    const offline = mftch.replayable(fetchFn, parsed, {
-      offline: true,
-      redact: { headers: ['X-Project-Secret'], fields: ['mnemonic'] },
-    });
-    deepStrictEqual(await (await offline(url, opts)).json(), {
-      token: '[REDACTED]',
-      nested: { mnemonic: '[REDACTED]', public: 'ok' },
-    });
   });
   it('maxBodySize', async () => {
     const body = 'a'.repeat(100);
