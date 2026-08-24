@@ -8,7 +8,7 @@
     "index.ts"
   ],
   "devDependencies": {
-    "@paulmillr/jsbt": "0.7.0",
+    "@paulmillr/jsbt": "0.7.1",
     "bismar": "0.1.8",
     "@types/node": "26.2.0",
     "prettier": "3.9.6",
