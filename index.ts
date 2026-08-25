@@ -42,6 +42,28 @@ async function nextTick(): Promise<void> {}
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
+function sleepAbortable(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (!signal) return sleep(ms);
+  const abortSignal = signal;
+  if (abortSignal.aborted)
+    return Promise.reject(abortSignal.reason ?? new Error('request aborted'));
+  return new Promise<void>((resolve, reject) => {
+    function cleanup(): void {
+      abortSignal.removeEventListener('abort', aborted);
+    }
+    function done(): void {
+      cleanup();
+      resolve();
+    }
+    function aborted(): void {
+      clearTimeout(timer);
+      cleanup();
+      reject(abortSignal.reason ?? new Error('request aborted'));
+    }
+    const timer = setTimeout(done, ms);
+    abortSignal.addEventListener('abort', aborted, { once: true });
+  });
+}
 const DEFAULT_SENSITIVE_HEADERS = [
   'authorization',
   'proxy-authorization',
@@ -51,13 +73,29 @@ const DEFAULT_SENSITIVE_HEADERS = [
   'api-key',
   'x-auth-token',
 ] as const;
+const MAX_PENDING_REQUESTS = 65_536;
+const DEFAULT_JSONRPC_TIMEOUT = 240_000;
+const DEFAULT_JSONRPC_CONCURRENCY = 10;
+const FTCH_WRAPPER = Symbol();
+class FetchPolicyError extends Error {
+  readonly retryable = false;
+}
+function markNotRetryable(error: unknown): unknown {
+  if (error !== null && (typeof error === 'object' || typeof error === 'function')) {
+    try {
+      Object.defineProperty(error, 'retryable', { value: false, configurable: true });
+      return error;
+    } catch {}
+  }
+  return new FetchPolicyError(String(error));
+}
 function validateStringList(value: unknown, name: string): asserts value is string[] | undefined {
   if (value !== undefined && (!Array.isArray(value) || value.some((v) => typeof v !== 'string')))
-    throw new Error(`${name} must be an array of strings`);
+    throw new FetchPolicyError(`${name} must be an array of strings`);
 }
 function validateTimeout(ms: number): void {
   if (!Number.isFinite(ms) || ms < 0)
-    throw new Error(`expected timeout to be a finite non-negative number, got ${ms}`);
+    throw new FetchPolicyError(`expected timeout to be a finite non-negative number, got ${ms}`);
 }
 // btoa/atob are Latin-1 only: convert through raw bytes, chunked to avoid arg-spread limits.
 function bytesToBase64(bytes: Uint8Array): string {
@@ -73,7 +111,10 @@ function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 // Small internal primitive to limit concurrency
-function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T> {
+function limit(
+  concurrencyLimit: number,
+  maxPendingRequests: number = MAX_PENDING_REQUESTS
+): <T>(fn: () => Promise<T>) => Promise<T> {
   // Non-positive limits cannot start queued work and would leave callers pending.
   if (!Number.isSafeInteger(concurrencyLimit) || concurrencyLimit <= 0)
     throw new Error(`expected concurrencyLimit > 0, got ${concurrencyLimit}`);
@@ -89,6 +130,10 @@ function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T
   }
   return <T>(fn: () => Promise<T>): Promise<T> =>
     new Promise<T>((resolve, reject) => {
+      if (queue.length >= maxPendingRequests) {
+        reject(new Error(`request queue full (max ${maxPendingRequests})`));
+        return;
+      }
       queue.push(() =>
         Promise.resolve()
           .then(fn)
@@ -103,15 +148,28 @@ function limit(concurrencyLimit: number): <T>(fn: () => Promise<T>) => Promise<T
     });
 }
 // Small internal primitive to space out starts: at most `rps` calls begin per second.
-function rateLimit(rps: number): <T>(fn: () => Promise<T>) => Promise<T> {
+function rateLimit(
+  rps: number,
+  maxPendingRequests: number = MAX_PENDING_REQUESTS
+): <T>(fn: () => Promise<T>) => Promise<T> {
   if (!Number.isFinite(rps) || rps <= 0) throw new Error(`expected rps > 0, got ${rps}`);
   const interval = 1000 / rps;
   let nextStart = 0;
+  let pending = 0;
   return async <T>(fn: () => Promise<T>): Promise<T> => {
     const now = Date.now();
     const start = Math.max(nextStart, now);
+    if (start > now && pending >= maxPendingRequests)
+      throw new Error(`request queue full (max ${maxPendingRequests})`);
     nextStart = start + interval;
-    if (start > now) await sleep(start - now);
+    if (start > now) {
+      pending++;
+      try {
+        await sleep(start - now);
+      } finally {
+        pending--;
+      }
+    }
     return fn();
   };
 }
@@ -156,7 +214,8 @@ export type FtchOpts = {
    */
   isValidRequest?: (url?: string) => boolean | Promise<boolean>;
   /**
-   * Alias for `isValidRequest`.
+   * Additional request gate. When `isValidRequest` is also configured, both callbacks must allow
+   * the request.
    * @param url - Request URL about to be fetched.
    * @returns `true` when the request should be allowed.
    */
@@ -186,9 +245,9 @@ export type FtchOpts = {
   allowInsecureRedirects?: boolean;
   /** Additional request headers to strip on cross-origin redirects. */
   sensitiveHeaders?: string[];
-  /** Maximum number of wrapped requests allowed to run at once. */
+  /** Maximum number of wrapped requests allowed to run at once; at most 65,536 more may wait. */
   concurrencyLimit?: number;
-  /** Maximum request starts per second. */
+  /** Maximum request starts per second; at most 65,536 delayed starts may wait. */
   rps?: number;
   /**
    * Maximum response body size in bytes; oversized responses are aborted.
@@ -245,7 +304,7 @@ async function readBodyLimited(
 ): Promise<Uint8Array<ArrayBuffer>> {
   function tooBig(): Error {
     abort.abort('maxBodySize exceeded');
-    return new Error(`response body exceeds maxBodySize=${maxBodySize}`);
+    return new FetchPolicyError(`response body exceeds maxBodySize=${maxBodySize}`);
   }
   const len = req.headers.get('content-length');
   if (len !== null && Number(len) > maxBodySize) throw tooBig();
@@ -296,7 +355,7 @@ function getRequestInfo(req: UnPromise<ReturnType<FetchFn>>) {
 function parseAllowedOrigins(hosts: string[] | undefined): string[] | undefined {
   return hosts?.map((host) => {
     function invalid(): Error {
-      return new Error('allowedHosts: invalid host entry: ' + host);
+      return new FetchPolicyError('allowedHosts: invalid host entry: ' + host);
     }
     if (host.length === 0 || host.trim() !== host) throw invalid();
     let parsed: URL;
@@ -388,9 +447,9 @@ function basicAuthFromUrl(parsed: URL): string {
  */
 export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
   if (opts.isValidRequest !== undefined && typeof opts.isValidRequest !== 'function')
-    throw new Error('opts.isValidRequest must be a function');
+    throw new FetchPolicyError('opts.isValidRequest must be a function');
   if (opts.killswitch !== undefined && typeof opts.killswitch !== 'function')
-    throw new Error('opts.killswitch must be a function');
+    throw new FetchPolicyError('opts.killswitch must be a function');
   const killswitchSignal = opts.killswitchSignal;
   if (
     killswitchSignal !== undefined &&
@@ -398,33 +457,34 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       typeof killswitchSignal.addEventListener !== 'function' ||
       typeof killswitchSignal.removeEventListener !== 'function')
   )
-    throw new Error('opts.killswitchSignal must be an AbortSignal');
+    throw new FetchPolicyError('opts.killswitchSignal must be an AbortSignal');
   if (opts.allowInsecureRedirects !== undefined && typeof opts.allowInsecureRedirects !== 'boolean')
-    throw new Error('opts.allowInsecureRedirects must be a boolean');
+    throw new FetchPolicyError('opts.allowInsecureRedirects must be a boolean');
   validateStringList(opts.sensitiveHeaders, 'opts.sensitiveHeaders');
   validateStringList(opts.allowedHosts, 'opts.allowedHosts');
   const redirectSensitiveHeaders = sensitiveHeaderSet(opts.sensitiveHeaders);
   const origins = parseAllowedOrigins(opts.allowedHosts);
   const maxBodySize = opts.maxBodySize === undefined ? 1024 ** 3 : opts.maxBodySize;
-  if (!(maxBodySize > 0)) throw new Error(`expected maxBodySize > 0, got ${maxBodySize}`);
+  if (!(maxBodySize > 0))
+    throw new FetchPolicyError(`expected maxBodySize > 0, got ${maxBodySize}`);
   if (opts.timeout !== undefined) validateTimeout(opts.timeout);
 
-  const ks = opts.isValidRequest ?? opts.killswitch;
   // The signal is re-checked after the hook: a killswitch aborted during the await must win.
   async function noNetwork(url: string): Promise<boolean> {
     if (killswitchSignal?.aborted) return true;
-    if (ks !== undefined && !(await ks(url))) return true;
+    if (opts.isValidRequest !== undefined && !(await opts.isValidRequest(url))) return true;
+    if (opts.killswitch !== undefined && !(await opts.killswitch(url))) return true;
     return killswitchSignal?.aborted === true;
   }
   // Checked before isValidRequest: the declarative allowlist must not be bypassable by hook logic.
   function checkHost(parsed: URL | undefined, url: string): void {
     if (origins === undefined) return;
     if (parsed === undefined)
-      throw new Error('allowedHosts: cannot verify host of relative URL: ' + url);
+      throw new FetchPolicyError('allowedHosts: cannot verify host of relative URL: ' + url);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
-      throw new Error('allowedHosts: scheme not allowed: ' + parsed.protocol);
+      throw new FetchPolicyError('allowedHosts: scheme not allowed: ' + parsed.protocol);
     if (!origins.includes(parsed.origin))
-      throw new Error(
+      throw new FetchPolicyError(
         `allowedHosts: host not allowed: ${parsed.host}; exact origin not allowed: ${parsed.origin}`
       );
   }
@@ -432,13 +492,13 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
   // (checked before the hop is sent) or via a non-conforming FetchFn's response URL.
   function checkRedirectTarget(from: URL, to: URL, toUrl: string): void {
     if (to.protocol !== 'http:' && to.protocol !== 'https:')
-      throw new Error('redirect: scheme not allowed: ' + to.protocol);
+      throw new FetchPolicyError('redirect: scheme not allowed: ' + to.protocol);
     if (
       from.protocol === 'https:' &&
       to.protocol === 'http:' &&
       opts.allowInsecureRedirects !== true
     )
-      throw new Error('redirect: HTTPS to HTTP downgrade not allowed: ' + toUrl);
+      throw new FetchPolicyError('redirect: HTTPS to HTTP downgrade not allowed: ' + toUrl);
   }
   // Belt and braces for non-conforming FetchFn implementations that ignore
   // `redirect: 'manual'`: validate the reported URL before hooks or body reads.
@@ -448,7 +508,9 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
       finalUrl = new URL(reportedUrl);
     } catch {
       abort.abort('invalid response URL');
-      throw new Error('allowedHosts: cannot verify host of response URL: ' + reportedUrl);
+      throw new FetchPolicyError(
+        'allowedHosts: cannot verify host of response URL: ' + reportedUrl
+      );
     }
     try {
       checkRedirectTarget(current, finalUrl, reportedUrl);
@@ -465,7 +527,7 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
     async function assertNetwork(hopUrl: string): Promise<void> {
       if (await noNetwork(hopUrl)) {
         abort.abort('network disabled');
-        throw new Error('network disabled');
+        throw new FetchPolicyError('network disabled');
       }
     }
     try {
@@ -532,14 +594,19 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
         if (!location) break;
         // The hop's body is never read; release its socket.
         res.body?.cancel().catch(() => {});
-        if (++hops > 20) throw new Error('too many redirects: ' + url);
+        if (++hops > 20) throw new FetchPolicyError('too many redirects: ' + url);
         // Relative locations resolve against the hop that issued them.
-        const next = new URL(location, current);
+        let next: URL;
+        try {
+          next = new URL(location, current);
+        } catch {
+          throw new FetchPolicyError('redirect: invalid location: ' + location);
+        }
         checkRedirectTarget(current, next, next.href);
         // Fetch spec: credentials never ride a redirect, and Authorization
         // must not leak to a different origin.
         if (next.username || next.password)
-          throw new Error('redirect carries credentials: ' + next.host);
+          throw new FetchPolicyError('redirect carries credentials: ' + next.host);
         if (current.origin !== next.origin) {
           // No cookie jar here: manually set credentials and API keys would otherwise
           // ride to a different allowed origin.
@@ -582,6 +649,9 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
         text: async () => new TextDecoder().decode(body),
         arrayBuffer: async () => body.buffer,
       };
+    } catch (error) {
+      if (killswitchSignal?.aborted) throw markNotRetryable(error);
+      throw error;
     } finally {
       for (const cleanup of cleanups) cleanup();
     }
@@ -598,6 +668,7 @@ export function ftch(fetchFunction: FetchFn, opts: FtchOpts = {}): FetchFn {
     const inner = out;
     out = (url, reqOpts) => curLimit(() => inner(url, reqOpts));
   }
+  Object.defineProperty(out, FTCH_WRAPPER, { value: true });
   return out;
 }
 
@@ -628,6 +699,18 @@ export type JsonrpcInterface = {
 type NetworkOpts = {
   batchSize?: number;
   headers?: Record<string, string>;
+  /** Additional exact origins allowed for redirects. The RPC URL's origin is always allowed. */
+  allowedHosts?: string[];
+  /**
+   * Abort JSON-RPC HTTP requests after this many milliseconds. Default: 240,000 for transports
+   * not created by `ftch`; otherwise the transport's timeout is inherited unless this is set.
+   */
+  timeout?: number;
+  /**
+   * Maximum simultaneous JSON-RPC HTTP requests. Default: 10 for transports not created by
+   * `ftch`; otherwise the transport's limit is inherited unless this is set.
+   */
+  concurrencyLimit?: number;
 };
 
 type RpcParams = any[] | Record<string, any>;
@@ -656,8 +739,8 @@ export class RpcError extends Error {
 /**
  * Small utility class for Jsonrpc
  * @param fetchFunction - Fetch implementation used for transport.
- * @param rpcUrl - JSON-RPC endpoint URL.
- * @param options - Batching and header configuration. See {@link NetworkOpts}.
+ * @param rpcUrl - Absolute HTTP(S) JSON-RPC endpoint URL. Its origin is allowed automatically.
+ * @param options - Batching, header, and additional redirect-origin configuration. See {@link NetworkOpts}.
  * @example
  * Create a batched JSON-RPC client and call it with positional and named params.
  * ```js
@@ -679,7 +762,24 @@ export class JsonrpcProvider implements JsonrpcInterface {
   constructor(fetchFunction: FetchFn, rpcUrl: string, options: NetworkOpts = {}) {
     if (typeof fetchFunction !== 'function') throw new Error('fetchFunction is required');
     if (typeof rpcUrl !== 'string') throw new Error('rpcUrl is required');
-    this.fetchFunction = fetchFunction;
+    let parsedRpcUrl: URL;
+    try {
+      parsedRpcUrl = new URL(rpcUrl);
+    } catch {
+      throw new FetchPolicyError('rpcUrl must be an absolute HTTP(S) URL');
+    }
+    if (parsedRpcUrl.protocol !== 'http:' && parsedRpcUrl.protocol !== 'https:')
+      throw new FetchPolicyError('rpcUrl must be an absolute HTTP(S) URL');
+    validateStringList(options.allowedHosts, 'options.allowedHosts');
+    const transportUsesFtch = Object.hasOwn(fetchFunction, FTCH_WRAPPER);
+    // Apply the RPC allowlist even when the supplied transport is native fetch or another ftch
+    // wrapper. Unwrapped transports also receive conservative operational defaults.
+    this.fetchFunction = ftch(fetchFunction, {
+      allowedHosts: [parsedRpcUrl.origin, ...(options.allowedHosts || [])],
+      timeout: options.timeout ?? (transportUsesFtch ? undefined : DEFAULT_JSONRPC_TIMEOUT),
+      concurrencyLimit:
+        options.concurrencyLimit ?? (transportUsesFtch ? undefined : DEFAULT_JSONRPC_CONCURRENCY),
+    });
     this.rpcUrl = rpcUrl;
     this.batchSize = options.batchSize === undefined ? 1 : options.batchSize;
     if (!Number.isSafeInteger(this.batchSize) || this.batchSize <= 0)
@@ -777,8 +877,8 @@ export class JsonrpcProvider implements JsonrpcInterface {
 /**
  * Batched JSON-RPC functionality.
  * @param fetchFunction - Fetch implementation used for transport.
- * @param rpcUrl - JSON-RPC endpoint URL.
- * @param options - Batching and header configuration. See {@link NetworkOpts}.
+ * @param rpcUrl - Absolute HTTP(S) JSON-RPC endpoint URL. Its origin is allowed automatically.
+ * @param options - Batching, header, and additional redirect-origin configuration. See {@link NetworkOpts}.
  * @returns Configured JSON-RPC provider.
  * @example
  * Create a batched JSON-RPC helper.
@@ -1030,6 +1130,8 @@ export function replayable(
   wrapped.accessed = accessed;
   wrapped.export = () =>
     JSON.stringify(Object.fromEntries(Object.entries(logs).filter(([key]) => accessed.has(key))));
+  if (Object.hasOwn(fetchFunction, FTCH_WRAPPER))
+    Object.defineProperty(wrapped, FTCH_WRAPPER, { value: true });
   return wrapped;
 }
 
@@ -1059,7 +1161,8 @@ export type RetryOpts = {
   /**
    * Decides whether a failed attempt should be retried.
    * Default policy only retries safe methods (GET/HEAD/OPTIONS) — retrying a POST can duplicate
-   * a non-idempotent action — and only on thrown errors or status 408/429/5xx.
+   * a non-idempotent action — and only on retryable thrown errors or status 408/429/5xx.
+   * Abort errors and errors marked with `retryable: false` are not retried by default.
    * Pass a custom predicate to retry POST (e.g. JSON-RPC) explicitly.
    */
   shouldRetry?: (ctx: RetryContext) => boolean;
@@ -1068,6 +1171,8 @@ export type RetryOpts = {
 function defaultShouldRetry(ctx: RetryContext): boolean {
   const method = (ctx.opts.method || 'GET').toUpperCase();
   if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') return false;
+  const error = ctx.error as { name?: unknown; retryable?: unknown } | null | undefined;
+  if (error && (error.retryable === false || error.name === 'AbortError')) return false;
   if (ctx.status === undefined) return true; // thrown error: network failure, timeout
   return ctx.status === 408 || ctx.status === 429 || ctx.status >= 500;
 }
@@ -1120,8 +1225,9 @@ export function retry(fetchFunction: FetchFn, opts: RetryOpts = {}): FetchFn {
     throw new Error(`expected maxDelay to be a finite non-negative number, got ${maxDelay}`);
   const shouldRetry = opts.shouldRetry || defaultShouldRetry;
   if (typeof shouldRetry !== 'function') throw new Error('opts.shouldRetry must be a function');
-  return async (url, reqOpts = {}) => {
+  const wrapped: FetchFn = async (url, reqOpts = {}) => {
     for (let attempt = 0; ; attempt++) {
+      if (reqOpts.signal?.aborted) throw reqOpts.signal.reason ?? new Error('request aborted');
       let res;
       let error: unknown;
       let failed = false;
@@ -1131,32 +1237,42 @@ export function retry(fetchFunction: FetchFn, opts: RetryOpts = {}): FetchFn {
         error = e;
         failed = true;
       }
+      if (reqOpts.signal?.aborted) throw reqOpts.signal.reason ?? new Error('request aborted');
       const success = !failed && res !== undefined && res.ok;
       const isLast = attempt >= attempts - 1;
-      const aborted =
-        reqOpts.signal !== undefined && reqOpts.signal !== null && reqOpts.signal.aborted;
       if (
         success ||
         isLast ||
-        aborted ||
         !shouldRetry({ url, opts: reqOpts, attempt, error, status: res && res.status })
       ) {
         if (failed) throw error;
         return res!;
       }
+      // The intermediate response is never returned; cancel instead of draining an untrusted body.
+      try {
+        await res?.body?.cancel('response is being retried');
+      } catch {}
       // Retry-After takes priority over computed backoff; both are capped by maxDelay.
       const retryAfter = res === undefined ? undefined : parseRetryAfter(res.headers);
       const backoff = Math.random() * Math.min(maxDelay, baseDelay * 2 ** attempt);
-      await sleep(retryAfter === undefined ? backoff : Math.min(retryAfter, maxDelay));
+      await sleepAbortable(
+        retryAfter === undefined ? backoff : Math.min(retryAfter, maxDelay),
+        reqOpts.signal
+      );
     }
   };
+  if (Object.hasOwn(fetchFunction, FTCH_WRAPPER))
+    Object.defineProperty(wrapped, FTCH_WRAPPER, { value: true });
+  return wrapped;
 }
 
 /** Internal methods for test purposes only. */
 export const _TEST: {
   limit: typeof limit;
   rateLimit: typeof rateLimit;
+  MAX_PENDING_REQUESTS: number;
 } = /* @__PURE__ */ Object.freeze({
   limit,
   rateLimit,
+  MAX_PENDING_REQUESTS,
 });

@@ -134,6 +134,17 @@ describe('Network', () => {
         message: 'expected concurrencyLimit > 0, got -1',
       });
     });
+    it('rejects concurrency queue overflow', async () => {
+      deepStrictEqual(mftch._TEST.MAX_PENDING_REQUESTS, 65_536);
+      let release;
+      const blocked = new Promise((resolve) => (release = resolve));
+      const limit1 = limit(1, 1);
+      const active = limit1(() => blocked);
+      const queued = limit1(async () => 2);
+      await rejects(() => limit1(async () => 3), /request queue full \(max 1\)/);
+      release(1);
+      deepStrictEqual(await Promise.all([active, queued]), [1, 2]);
+    });
   });
   if (REAL_NETWORK) {
     describe('Real network', () => {
@@ -766,6 +777,100 @@ describe('Wrappers v1.1', () => {
       arrayBuffer: async () => new TextEncoder().encode(body).buffer,
     };
   };
+  it('jsonrpc allowlists its RPC origin for native and wrapped fetch', async () => {
+    const rpcUrl = 'https://rpc.example.com/v1';
+    const redirectUrl = 'https://redirect.example/steal';
+    for (const alreadyWrapped of [false, true]) {
+      const sent: string[] = [];
+      const transport: mftch.FetchFn = async (url, opts = {}) => {
+        sent.push(url);
+        deepStrictEqual(opts.redirect, 'manual');
+        return fakeRes({ url, status: 302, headers: { location: redirectUrl } });
+      };
+      const fetchFunction = alreadyWrapped ? mftch.ftch(transport) : transport;
+      const rpc = mftch.jsonrpc(fetchFunction, rpcUrl);
+      await rejects(() => rpc.call('test'), /host not allowed: redirect\.example/);
+      deepStrictEqual(sent, [rpcUrl]);
+    }
+
+    const sent: string[] = [];
+    const redirectingTransport: mftch.FetchFn = async (url) => {
+      sent.push(url);
+      return url === rpcUrl
+        ? fakeRes({ url, status: 302, headers: { location: redirectUrl } })
+        : fakeRes({ url, body: '{"jsonrpc":"2.0","id":0,"result":1}' });
+    };
+    const rpc = mftch.jsonrpc(redirectingTransport, rpcUrl, {
+      allowedHosts: ['redirect.example'],
+    });
+    deepStrictEqual(await rpc.call('test'), 1);
+    deepStrictEqual(sent, [rpcUrl, redirectUrl]);
+    throws(
+      () => mftch.jsonrpc(redirectingTransport, '/relative'),
+      /rpcUrl must be an absolute HTTP\(S\) URL/
+    );
+  });
+  it('jsonrpc adds operational defaults only to unwrapped transports', async () => {
+    const rpcUrl = 'https://rpc.example.com/';
+    const scheduled: number[] = [];
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((handler, ms, ...args) => {
+      scheduled.push(Number(ms));
+      return originalSetTimeout(handler, ms, ...args);
+    }) as typeof setTimeout;
+    try {
+      const immediateTransport: mftch.FetchFn = async (url) =>
+        fakeRes({ url, body: '{"jsonrpc":"2.0","id":0,"result":1}' });
+      await mftch.jsonrpc(immediateTransport, rpcUrl).call('test');
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+    deepStrictEqual(scheduled.includes(240_000), true);
+
+    const controlledTransport = () => {
+      const releases: (() => void)[] = [];
+      let started = 0;
+      const fetchFunction: mftch.FetchFn = async (url) => {
+        started++;
+        await new Promise<void>((resolve) => releases.push(resolve));
+        return fakeRes({ url, body: '{"jsonrpc":"2.0","id":0,"result":1}' });
+      };
+      return { fetchFunction, releases, started: () => started };
+    };
+
+    const raw = controlledTransport();
+    const rawRpc = mftch.jsonrpc(raw.fetchFunction, rpcUrl);
+    const rawCalls = Array.from({ length: 11 }, () => rawRpc.call('test'));
+    await sleep(0);
+    deepStrictEqual(raw.started(), 10);
+    raw.releases.shift()!();
+    await sleep(0);
+    deepStrictEqual(raw.started(), 11);
+    raw.releases.forEach((release) => release());
+    deepStrictEqual(await Promise.all(rawCalls), Array(11).fill(1));
+
+    const configuredTransports: ((fetchFunction: mftch.FetchFn) => mftch.FetchFn)[] = [
+      (fetchFunction) => mftch.ftch(fetchFunction),
+      (fetchFunction) => mftch.retry(mftch.ftch(fetchFunction)),
+      (fetchFunction) => mftch.replayable(mftch.ftch(fetchFunction)),
+    ];
+    for (const configure of configuredTransports) {
+      const wrapped = controlledTransport();
+      const wrappedRpc = mftch.jsonrpc(configure(wrapped.fetchFunction), rpcUrl);
+      const wrappedCalls = Array.from({ length: 11 }, () => wrappedRpc.call('test'));
+      await sleep(0);
+      deepStrictEqual(wrapped.started(), 11);
+      wrapped.releases.forEach((release) => release());
+      deepStrictEqual(await Promise.all(wrappedCalls), Array(11).fill(1));
+    }
+
+    const timeoutTransport: mftch.FetchFn = async (_url, opts = {}) =>
+      new Promise<never>((_resolve, reject) => {
+        opts.signal?.addEventListener('abort', () => reject(opts.signal?.reason), { once: true });
+      });
+    const timeoutRpc = mftch.jsonrpc(timeoutTransport, rpcUrl, { timeout: 1 });
+    await rejects(() => timeoutRpc.call('test'));
+  });
   it('allowedHosts', async () => {
     const calls = [];
     const fetchFn = async (url) => {
@@ -1017,6 +1122,25 @@ describe('Wrappers v1.1', () => {
     const asyncBlocked = mftch.ftch(fetchFn, { isValidRequest: async () => false });
     await rejects(() => asyncBlocked('https://example.com/'), /network disabled/);
     deepStrictEqual(calls, 0);
+
+    // Both configured callbacks are independent gates; neither may silently disable the other.
+    let isValidCalls = 0;
+    let killswitchCalls = 0;
+    const emergencyBlocked = mftch.ftch(fetchFn, {
+      isValidRequest: () => {
+        isValidCalls++;
+        return true;
+      },
+      killswitch: () => {
+        killswitchCalls++;
+        return false;
+      },
+    });
+    await rejects(() => emergencyBlocked('https://example.com/'), /network disabled/);
+    deepStrictEqual(
+      { calls, isValidCalls, killswitchCalls },
+      { calls: 0, isValidCalls: 1, killswitchCalls: 1 }
+    );
 
     // Runtime JS callers cannot supply an object that stringifies differently for validation/fetch.
     let conversions = 0;
@@ -1336,6 +1460,8 @@ describe('Wrappers v1.1', () => {
     );
     throws(() => mftch.jsonrpc(fetchFn, 'https://example.com/', { batchSize: 0 }));
     throws(() => mftch.jsonrpc(fetchFn, 'https://example.com/', { batchSize: 1.5 }));
+    throws(() => mftch.jsonrpc(fetchFn, 'https://example.com/', { timeout: Infinity }));
+    throws(() => mftch.jsonrpc(fetchFn, 'https://example.com/', { concurrencyLimit: 0 }));
     throws(() => mftch.retry(fetchFn, { baseDelay: Infinity }));
     throws(() => mftch.retry(fetchFn, { maxDelay: -1 }));
   });
@@ -1406,6 +1532,11 @@ describe('Wrappers v1.1', () => {
     // timers may fire marginally early; assert spacing with tolerance
     for (const gap of [starts[1] - starts[0], starts[2] - starts[1]])
       deepStrictEqual(gap >= 40, true, `expected gap >= 40ms, got ${gap}`);
+
+    const rate = mftch._TEST.rateLimit(20, 2);
+    const limited = [rate(async () => 1), rate(async () => 2), rate(async () => 3)];
+    await rejects(() => rate(async () => 4), /request queue full \(max 2\)/);
+    deepStrictEqual(await Promise.all(limited), [1, 2, 3]);
     throws(() => mftch.ftch(async (url) => fakeRes({ url }), { rps: 0 }));
   });
   it('replayable response metadata', async () => {
@@ -1463,6 +1594,93 @@ describe('Wrappers v1.1', () => {
       /conn reset/
     );
     deepStrictEqual(n, 2);
+    // Deterministic ftch policy failures are not retried by the default policy.
+    let downloads = 0;
+    const hostile = async (url) => {
+      downloads++;
+      return fakeRes({ url, body: 'x'.repeat(1024) });
+    };
+    const sizeLimited = mftch.retry(mftch.ftch(hostile, { maxBodySize: 32 }), {
+      attempts: 3,
+      baseDelay: 0,
+      maxDelay: 0,
+    });
+    await rejects(() => sizeLimited('https://x.com/'), /maxBodySize/);
+    deepStrictEqual(downloads, 1);
+    // Abort errors are deterministic even when the caller did not supply the abort signal.
+    n = 0;
+    await rejects(
+      () =>
+        mftch.retry(
+          async () => {
+            n++;
+            throw new DOMException('aborted', 'AbortError');
+          },
+          { attempts: 3, baseDelay: 0 }
+        )('https://x.com/'),
+      { name: 'AbortError' }
+    );
+    deepStrictEqual(n, 1);
+    // A custom predicate remains authoritative and can opt back into policy-error retries.
+    downloads = 0;
+    await rejects(() =>
+      mftch.retry(mftch.ftch(hostile, { maxBodySize: 32 }), {
+        attempts: 2,
+        baseDelay: 0,
+        maxDelay: 0,
+        shouldRetry: () => true,
+      })('https://x.com/')
+    );
+    deepStrictEqual(downloads, 2);
+    // Abort interrupts Retry-After immediately and prevents another transport invocation.
+    const controller = new AbortController();
+    const reason = new Error('client disconnected');
+    let retryAfterCalls = 0;
+    const waiting = mftch.retry(
+      async (url) => {
+        retryAfterCalls++;
+        return fakeRes({ url, status: 429, headers: { 'retry-after': '60' } });
+      },
+      { attempts: 2, maxDelay: 60_000 }
+    )('https://x.com/', { signal: controller.signal });
+    await sleep(0);
+    controller.abort(reason);
+    await rejects(waiting, reason);
+    deepStrictEqual(retryAfterCalls, 1);
+    // Discarded HTTP responses are cancelled before the next attempt starts.
+    let cancelled = 0;
+    let cancelReason;
+    let cancellationFinished = false;
+    let responseCalls = 0;
+    const retryingResponse = mftch.retry(
+      async (url) => {
+        responseCalls++;
+        if (responseCalls === 1)
+          return {
+            ...fakeRes({ url, status: 500 }),
+            body: new ReadableStream({
+              async cancel(reason) {
+                cancelled++;
+                cancelReason = reason;
+                await Promise.resolve();
+                cancellationFinished = true;
+              },
+            }),
+          };
+        deepStrictEqual(cancellationFinished, true);
+        return fakeRes({ url, body: 'ok' });
+      },
+      { attempts: 2, baseDelay: 0, maxDelay: 0 }
+    );
+    deepStrictEqual(await (await retryingResponse('https://x.com/')).text(), 'ok');
+    deepStrictEqual(
+      { responseCalls, cancelled, cancelReason },
+      {
+        responseCalls: 2,
+        cancelled: 1,
+        cancelReason: 'response is being retried',
+      }
+    );
     // 5xx retried for GET; last non-ok response is returned, not thrown
     n = 0;
     const f500 = mftch.retry(
